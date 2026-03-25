@@ -11,7 +11,8 @@
       "Bash(mkdir -p /c/Users/User/Desktop/pserso-ai-devrel/app/blocked)",
       "Bash(npx tsc:*)",
       "Bash(xargs grep:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(grep -r \"vercel.app\\\\|VERCEL_URL\\\\|vercel.com\" /c/Users/User/Desktop/pserso-ai-devrel --include=*.json --include=*.ts --include=*.tsx --include=*.md --include=*.env* -l)"
     ]
   }
 }

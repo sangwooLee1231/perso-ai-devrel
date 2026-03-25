@@ -19,7 +19,6 @@ export default function DubForm() {
   const [result, setResult] = useState<DubResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  // Track blob URL so we can revoke it on next run / unmount
   const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -39,7 +38,6 @@ export default function DubForm() {
     e.preventDefault();
     if (!file) return;
 
-    // Clean up previous blob URL
     if (blobUrlRef.current) {
       URL.revokeObjectURL(blobUrlRef.current);
       blobUrlRef.current = null;
@@ -86,11 +84,12 @@ export default function DubForm() {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-6">
-      {/* File input */}
+      {/* File upload */}
       <div>
-        <label className="block text-sm font-medium mb-1">
-          Audio file <span className="text-gray-400 font-normal">(mp3, wav, m4a, …)</span>
-        </label>
+        <label className="block text-sm font-medium mb-1">Audio file</label>
+        <p className="text-xs text-gray-500 mb-2">
+          Accepts MP3, WAV, M4A, FLAC, OGG, and other common audio formats.
+        </p>
         <input
           type="file"
           accept="audio/*"
@@ -98,8 +97,8 @@ export default function DubForm() {
           className="block w-full text-sm"
         />
         {file && (
-          <p className="mt-1 text-xs text-gray-500">
-            {file.name} — {(file.size / 1024).toFixed(1)} KB
+          <p className="mt-1.5 text-xs text-gray-400">
+            Selected: {file.name} ({(file.size / 1024).toFixed(1)} KB)
           </p>
         )}
       </div>
@@ -107,6 +106,9 @@ export default function DubForm() {
       {/* Language selector */}
       <div>
         <label className="block text-sm font-medium mb-1">Target language</label>
+        <p className="text-xs text-gray-500 mb-2">
+          The audio will be transcribed, translated, and re-spoken in this language.
+        </p>
         <select
           value={targetLanguage}
           onChange={(e) => setTargetLanguage(e.target.value)}
@@ -121,62 +123,75 @@ export default function DubForm() {
       </div>
 
       {/* Submit */}
-      <button
-        type="submit"
-        disabled={!file || status === "loading"}
-        className="self-start rounded-md bg-blue-600 px-6 py-2 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-      >
-        {status === "loading" ? "Processing…" : "Dub audio"}
-      </button>
+      <div>
+        <button
+          type="submit"
+          disabled={!file || status === "loading"}
+          className="rounded-md bg-blue-600 px-6 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {status === "loading" ? "Processing…" : "Generate dubbed audio"}
+        </button>
+      </div>
 
-      {/* Loading feedback */}
+      {/* Loading */}
       {status === "loading" && (
-        <p className="text-sm text-gray-500">
-          Transcribing → translating to {selectedLabel} → generating speech…
-          <br />
-          This usually takes 15–45 seconds depending on audio length.
-        </p>
+        <div className="rounded-md border border-blue-100 bg-blue-50 p-4 text-sm text-blue-700">
+          <p className="font-medium">Working on it…</p>
+          <p className="mt-1 text-blue-600">
+            Step 1: Transcribing audio &rarr; Step 2: Translating to {selectedLabel} &rarr; Step 3: Generating speech
+          </p>
+          <p className="mt-1 text-xs text-blue-500">
+            This usually takes 15–45 seconds depending on audio length.
+          </p>
+        </div>
       )}
 
       {/* Error */}
       {status === "error" && error && (
-        <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-          <strong>Error:</strong> {error}
+        <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+          <p className="font-medium mb-1">Something went wrong</p>
+          <p className="text-red-700">{error}</p>
         </div>
       )}
 
       {/* Results */}
       {status === "done" && result && (
-        <div className="flex flex-col gap-5 pt-2">
-          <div>
-            <h2 className="text-sm font-semibold mb-1">Transcript (original)</h2>
-            <p className="whitespace-pre-wrap rounded border bg-gray-50 p-3 text-sm leading-relaxed">
-              {result.transcript}
-            </p>
-          </div>
+        <>
+          <hr className="border-gray-200" />
 
-          <div>
-            <h2 className="text-sm font-semibold mb-1">Translation → {selectedLabel}</h2>
-            <p className="whitespace-pre-wrap rounded border bg-gray-50 p-3 text-sm leading-relaxed">
-              {result.translation}
-            </p>
-          </div>
+          <div className="flex flex-col gap-5">
+            <div>
+              <h2 className="text-sm font-semibold mb-1">Original transcript</h2>
+              <p className="whitespace-pre-wrap rounded border border-gray-200 bg-gray-50 p-3 text-sm leading-relaxed text-gray-800">
+                {result.transcript}
+              </p>
+            </div>
 
-          <div>
-            <h2 className="text-sm font-semibold mb-2">Dubbed audio</h2>
-            {audioUrl && (
-              // eslint-disable-next-line jsx-a11y/media-has-caption
-              <audio controls src={audioUrl} className="w-full" />
-            )}
-            <button
-              type="button"
-              onClick={handleDownload}
-              className="mt-3 rounded-md border border-gray-300 px-4 py-2 text-sm hover:bg-gray-100"
-            >
-              Download MP3
-            </button>
+            <div>
+              <h2 className="text-sm font-semibold mb-1">
+                Translation &mdash; {selectedLabel}
+              </h2>
+              <p className="whitespace-pre-wrap rounded border border-gray-200 bg-gray-50 p-3 text-sm leading-relaxed text-gray-800">
+                {result.translation}
+              </p>
+            </div>
+
+            <div>
+              <h2 className="text-sm font-semibold mb-2">Dubbed audio</h2>
+              {audioUrl && (
+                // eslint-disable-next-line jsx-a11y/media-has-caption
+                <audio controls src={audioUrl} className="w-full" />
+              )}
+              <button
+                type="button"
+                onClick={handleDownload}
+                className="mt-3 rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+              >
+                ↓ Download MP3
+              </button>
+            </div>
           </div>
-        </div>
+        </>
       )}
     </form>
   );
