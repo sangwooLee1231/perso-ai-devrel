@@ -155,6 +155,7 @@ export default function DubForm() {
   const [result, setResult] = useState<DubResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -168,8 +169,7 @@ export default function DubForm() {
    * Uses <video> element for video files — iOS Safari reads video metadata
    * more reliably from a <video> element than from <audio>.
    */
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0] ?? null;
+  const selectFile = async (selected: File | null) => {
     setFile(selected);
     setFileDuration(null);
     if (!selected) return;
@@ -192,6 +192,28 @@ export default function DubForm() {
     if (Number.isFinite(el.duration)) {
       setFileDuration(el.duration);
     }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    await selectFile(e.target.files?.[0] ?? null);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragging(false);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    await selectFile(e.dataTransfer.files[0] ?? null);
   };
 
   const buildBlobUrl = (base64: string, mimeType: string): string => {
@@ -323,16 +345,25 @@ export default function DubForm() {
     <form onSubmit={handleSubmit} className="flex flex-col gap-4">
 
       {/* ── File upload card ─────────────────────────────────────────────────── */}
-      <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-        <p className="text-sm font-medium text-gray-900 mb-0.5">파일 선택</p>
+      <section className="rounded-2xl border border-gray-100 bg-white p-5 shadow">
+        <p className="text-sm font-semibold text-gray-800 mb-0.5">파일 선택</p>
         <p className="text-xs text-gray-400 mb-3">
           MP3 · WAV · M4A · FLAC · OGG &nbsp;|&nbsp; MP4 · WebM &nbsp;·&nbsp; 60초 초과 시 앞 60초만 처리
         </p>
 
-        {/* Styled drop-zone wrapping the hidden input */}
-        <label className="flex flex-col items-center gap-2 w-full cursor-pointer rounded-xl border-2 border-dashed border-gray-200 bg-gray-50 py-7 px-4 text-center transition-colors hover:border-blue-300 hover:bg-blue-50/40">
+        {/* Drop zone */}
+        <label
+          className={`flex flex-col items-center gap-2 w-full cursor-pointer rounded-xl border-2 border-dashed py-8 px-4 text-center transition-all duration-150 ${
+            isDragging
+              ? "border-blue-400 bg-blue-50 scale-[1.01]"
+              : "border-gray-200 bg-gray-50/60 hover:border-blue-300 hover:bg-blue-50/30"
+          }`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
           <svg
-            className="w-6 h-6 text-gray-300"
+            className={`w-7 h-7 transition-colors ${isDragging ? "text-blue-400" : "text-gray-300"}`}
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -344,12 +375,12 @@ export default function DubForm() {
               d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"
             />
           </svg>
-          <span className="text-sm text-gray-500">
-            {file ? file.name : "파일 선택 또는 드래그"}
+          <span className={`text-sm font-medium transition-colors ${isDragging ? "text-blue-500" : "text-gray-500"}`}>
+            {isDragging ? "여기에 놓으세요" : file ? file.name : "파일 선택 또는 드래그 앤 드롭"}
           </span>
-          {!file && (
+          {!file && !isDragging && (
             <span className="text-xs text-gray-400">
-              audio/* · video/mp4 · video/webm · video/quicktime
+              audio/* · video/mp4 · video/webm
             </span>
           )}
           <input
@@ -385,8 +416,8 @@ export default function DubForm() {
       </section>
 
       {/* ── Language selector card ───────────────────────────────────────────── */}
-      <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-        <p className="text-sm font-medium text-gray-900 mb-0.5">목표 언어</p>
+      <section className="rounded-2xl border border-gray-100 bg-white p-5 shadow">
+        <p className="text-sm font-semibold text-gray-800 mb-0.5">목표 언어</p>
         <p className="text-xs text-gray-400 mb-3">
           원본 음성을 전사·번역·합성하여 선택한 언어로 더빙합니다.
         </p>
@@ -408,7 +439,7 @@ export default function DubForm() {
         <button
           type="submit"
           disabled={!file || status === "loading"}
-          className="w-full rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-blue-700 active:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-40"
+          className="w-full rounded-xl bg-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-sm transition-all hover:bg-blue-700 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
         >
           {status === "loading" ? "처리 중…" : "더빙 생성"}
         </button>
@@ -421,10 +452,10 @@ export default function DubForm() {
 
       {/* ── Loading — step chips + spinner ───────────────────────────────────── */}
       {status === "loading" && (
-        <div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-4">
+        <div className="rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 to-indigo-50/40 px-5 py-4">
           <div className="flex items-center gap-2.5 mb-2">
-            <span className="inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-blue-200 border-t-blue-600" />
-            <p className="text-sm font-medium text-blue-700">
+            <span className="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-blue-200 border-t-blue-500" />
+            <p className="text-sm font-semibold text-blue-700">
               {step === 0 && "파일 확인 중…"}
               {step === 1 &&
                 (isVideoFile
@@ -436,15 +467,15 @@ export default function DubForm() {
           {step === 2 && (
             <>
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs text-blue-600">
+                <span className="rounded-full bg-white/70 border border-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-600">
                   음성 전사
                 </span>
                 <span className="text-xs text-blue-300">→</span>
-                <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs text-blue-600">
+                <span className="rounded-full bg-white/70 border border-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-600">
                   {selectedLabel} 번역
                 </span>
                 <span className="text-xs text-blue-300">→</span>
-                <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs text-blue-600">
+                <span className="rounded-full bg-white/70 border border-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-600">
                   음성 합성
                 </span>
               </div>
@@ -458,8 +489,8 @@ export default function DubForm() {
 
       {/* ── Error ────────────────────────────────────────────────────────────── */}
       {status === "error" && error && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-5 py-4">
-          <p className="mb-1 text-sm font-medium text-red-700">오류가 발생했습니다</p>
+        <div className="rounded-2xl border border-red-100 bg-red-50/80 px-5 py-4">
+          <p className="mb-1 text-sm font-semibold text-red-700">오류가 발생했습니다</p>
           <p className="whitespace-pre-wrap text-sm text-red-600">{error}</p>
           <p className="mt-2.5 text-xs text-red-400">
             다른 파일 형식으로 시도하거나, 더 짧은 오디오 파일을 업로드해 보세요.
@@ -471,20 +502,22 @@ export default function DubForm() {
       {status === "done" && result && (
         <div className="flex flex-col gap-3 pt-1">
           <div className="flex items-center gap-1.5">
-            <svg className="w-3.5 h-3.5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-            </svg>
-            <span className="text-xs font-medium text-green-600">더빙 완료</span>
+            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-green-100">
+              <svg className="w-3 h-3 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+              </svg>
+            </span>
+            <span className="text-xs font-semibold text-green-700">더빙 완료</span>
           </div>
 
           {/* Transcript */}
-          <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+          <div className="rounded-2xl border border-gray-100 bg-white p-4 shadow">
             <div className="flex items-center justify-between mb-2">
-              <p className="text-xs font-medium uppercase tracking-wider text-gray-400">
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
                 원문 전사
                 {result.detectedLanguage && (
-                  <span className="ml-2 normal-case text-gray-400">
-                    ({LANGUAGE_NAMES[result.detectedLanguage] ?? result.detectedLanguage})
+                  <span className="ml-2 normal-case font-medium text-blue-400">
+                    {LANGUAGE_NAMES[result.detectedLanguage] ?? result.detectedLanguage}
                   </span>
                 )}
               </p>
@@ -496,20 +529,20 @@ export default function DubForm() {
                   a.download = "transcript.txt";
                   a.click();
                 }}
-                className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                className="text-xs text-gray-300 hover:text-blue-400 transition-colors"
               >
                 ↓ txt
               </button>
             </div>
-            <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-700">
               {result.transcript}
             </p>
           </div>
 
           {/* Translation */}
-          <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+          <div className="rounded-2xl border border-gray-100 bg-white p-4 shadow">
             <div className="flex items-center justify-between mb-2">
-              <p className="text-xs font-medium uppercase tracking-wider text-gray-400">
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
                 번역 — {selectedLabel}
               </p>
               <button
@@ -520,19 +553,19 @@ export default function DubForm() {
                   a.download = `translation_${targetLanguage.toLowerCase()}.txt`;
                   a.click();
                 }}
-                className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                className="text-xs text-gray-300 hover:text-blue-400 transition-colors"
               >
                 ↓ txt
               </button>
             </div>
-            <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-700">
               {result.translation}
             </p>
           </div>
 
           {/* Audio output */}
-          <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-            <p className="mb-3 text-xs font-medium uppercase tracking-wider text-gray-400">
+          <div className="rounded-2xl border border-gray-100 bg-white p-4 shadow">
+            <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
               더빙 오디오
             </p>
             {audioUrl && (
@@ -542,7 +575,7 @@ export default function DubForm() {
             <button
               type="button"
               onClick={handleDownload}
-              className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-50"
+              className="rounded-lg bg-gray-50 border border-gray-200 px-4 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 active:bg-gray-200"
             >
               ↓ MP3 다운로드
             </button>

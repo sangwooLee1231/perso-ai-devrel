@@ -2,13 +2,28 @@ import { signIn } from "@/auth";
 
 export default function LoginPage() {
   return (
-    <main className="min-h-screen bg-gray-50 flex flex-col items-center justify-center px-4">
-      <div className="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-8 shadow-sm flex flex-col gap-7">
-        <div className="flex flex-col gap-1.5">
-          <h1 className="text-xl font-semibold text-gray-900">AI Dubbing</h1>
+    <main className="min-h-screen bg-gradient-to-b from-blue-50/50 via-white to-slate-50 flex flex-col items-center justify-center px-4">
+      <div className="w-full max-w-sm rounded-2xl border border-gray-100 bg-white p-8 shadow flex flex-col gap-7">
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600 text-white text-xs font-bold">D</span>
+            <h1 className="text-xl font-bold text-gray-900">AI Dubbing</h1>
+          </div>
           <p className="text-sm text-gray-500">
-            로그인하여 더빙 서비스를 이용하세요.
+            오디오·영상을 업로드하면 원하는 언어로 더빙해드립니다.
           </p>
+          <ul className="flex flex-col gap-1.5 mt-1">
+            {[
+              "ElevenLabs STT로 자동 전사",
+              "DeepL로 10개 언어 번역",
+              "ElevenLabs TTS로 음성 합성",
+            ].map((item) => (
+              <li key={item} className="flex items-center gap-2 text-xs text-gray-400">
+                <span className="h-1 w-1 rounded-full bg-blue-400 shrink-0" />
+                {item}
+              </li>
+            ))}
+          </ul>
         </div>
 
         <form
