@@ -159,7 +159,9 @@ function buildVTT(chunks: string[], totalDuration: number, startOffset: number):
   chunks.forEach((chunk, i) => {
     const start = startOffset + i * chunkDur;
     const end = startOffset + (i + 1) * chunkDur;
-    vtt += `${formatVTTTime(start)} --> ${formatVTTTime(end)}\n${chunk}\n\n`;
+    // 이중 줄바꿈(\n\n)은 VTT 큐 종료 신호로 파싱되므로 단일 줄바꿈으로 압축
+    const safeChunk = chunk.replace(/\r\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
+    vtt += `${formatVTTTime(start)} --> ${formatVTTTime(end)}\n${safeChunk}\n\n`;
   });
   return vtt;
 }
@@ -328,6 +330,7 @@ export default function DubForm() {
   const [showSubtitles, setShowSubtitles] = useState<boolean>(true);
   const [subtitleIndex, setSubtitleIndex] = useState<number>(0);
   const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [videoDownloadNotice, setVideoDownloadNotice] = useState<string | null>(null);
   // 영상이 MediaRecorder 로 실제 크롭된 경우 true → 플레이어 start=0 기준
   const [videoCropped, setVideoCropped] = useState<boolean>(false);
   const [isCroppingVideo, setIsCroppingVideo] = useState<boolean>(false);
@@ -645,10 +648,8 @@ export default function DubForm() {
         setIsCroppingVideo(false);
       }
     } catch (err) {
-      // API 에러 시에도 크롭 프로미스는 정리
-      cropPromise.then((blob) => {
-        if (blob) URL.revokeObjectURL(URL.createObjectURL(blob));
-      }).catch(() => {});
+      // API 에러 시 크롭 프로미스의 미처리 거부만 억제 (blob은 GC에 맡김)
+      cropPromise.catch(() => {});
       if (!abortCtrl.cancelled) setIsCroppingVideo(false);
 
       const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
@@ -675,7 +676,12 @@ export default function DubForm() {
 
     const testEl = document.createElement("video");
     if (!("captureStream" in testEl)) {
-      // 미지원 → MP3 다운로드로 폴백
+      // iOS Safari 등 captureStream 미지원 → MP3로 폴백하며 사용자에게 안내
+      setVideoDownloadNotice(
+        "이 브라우저는 영상 합성을 지원하지 않아 더빙 MP3만 다운로드됩니다.\n" +
+        "영상 파일로 받으려면 Chrome 또는 Edge를 사용해 주세요."
+      );
+      setTimeout(() => setVideoDownloadNotice(null), 7000);
       handleDownload();
       return;
     }
@@ -865,6 +871,13 @@ export default function DubForm() {
           >
             ↓ MP3 다운로드
           </button>
+          {/* iOS Safari 등 captureStream 미지원 시 안내 */}
+          {videoDownloadNotice && (
+            <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+              <span className="text-amber-500 flex-shrink-0 mt-0.5">⚠</span>
+              <p className="text-xs text-amber-700 whitespace-pre-line leading-relaxed">{videoDownloadNotice}</p>
+            </div>
+          )}
         </div>
       </div>
     </div>

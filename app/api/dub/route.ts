@@ -7,6 +7,29 @@ import { SUPPORTED_LANGUAGES } from "@/lib/languages";
 // Allow up to 60 s for the full STT → translate → TTS pipeline
 export const maxDuration = 60;
 
+// ── 인메모리 레이트 리미터 ────────────────────────────────────────────────────
+// Vercel 서버리스 특성상 인스턴스별로 독립 동작하므로 엄밀한 전역 제한은 아니나
+// 단일 사용자의 반복 남용(API 크레딧 소진)을 효과적으로 방지함.
+// 프로덕션 확장 시 Upstash Redis 등 외부 스토어로 교체 권장.
+const RATE_LIMIT_MAX = 10;      // 최대 요청 수
+const RATE_LIMIT_WINDOW = 10 * 60 * 1000; // 10분 윈도우(ms)
+
+interface RateEntry { count: number; resetAt: number }
+const rateLimitMap = new Map<string, RateEntry>();
+
+function isRateLimited(userId: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(userId);
+
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(userId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return false;
+  }
+  if (entry.count >= RATE_LIMIT_MAX) return true;
+  entry.count++;
+  return false;
+}
+
 // ── 단계별 오류 → 한국어 친화 메시지 변환 ──────────────────────────────────
 
 function errCode(err: unknown): string {
@@ -41,6 +64,14 @@ export async function POST(request: Request) {
   const session = await auth();
   if (!session) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const userId = session.user?.email ?? "unknown";
+  if (isRateLimited(userId)) {
+    return NextResponse.json(
+      { error: `요청이 너무 많습니다. 10분당 최대 ${RATE_LIMIT_MAX}회까지 가능합니다. 잠시 후 다시 시도해 주세요.` },
+      { status: 429 }
+    );
   }
 
   try {
