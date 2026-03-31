@@ -146,10 +146,11 @@ export async function POST(request: Request) {
     }
 
     // 3. 단어를 발화 세그먼트로 그룹화
-    // 타임스탬프가 없으면 전체 텍스트를 단일 세그먼트로 처리
+    // 타임스탬프가 없거나 "word" 타입 토큰이 전혀 없으면 단일 세그먼트로 처리
+    const grouped = words.length > 0 ? groupWords(words) : [];
     const rawSegments =
-      words.length > 0
-        ? groupWords(words)
+      grouped.length > 0
+        ? grouped
         : [{ start: 0, end: 60, text: transcript }];
 
     // 4. 세그먼트 텍스트를 DeepL에 일괄 번역 (1번 요청)
@@ -167,10 +168,17 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: translateError(err) }, { status: 500 });
     }
 
-    // 5. 세그먼트별 TTS 병렬 실행
+    // 5. 세그먼트별 TTS — 동시 요청 3개로 제한 (ElevenLabs 동시성 제한 대응)
     let ttsBuffers: Buffer[];
     try {
-      ttsBuffers = await Promise.all(segmentTranslations.map((text) => textToSpeech(text)));
+      const CONCURRENCY = 3;
+      const results: Buffer[] = new Array(segmentTranslations.length);
+      for (let i = 0; i < segmentTranslations.length; i += CONCURRENCY) {
+        const batch = segmentTranslations.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.all(batch.map((text) => textToSpeech(text)));
+        batchResults.forEach((buf, j) => { results[i + j] = buf; });
+      }
+      ttsBuffers = results;
     } catch (err) {
       console.error("[/api/dub] TTS", err);
       return NextResponse.json({ error: ttsError(err) }, { status: 500 });

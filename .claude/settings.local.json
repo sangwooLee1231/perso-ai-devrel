@@ -16,7 +16,15 @@
       "Bash(/c/Users/User/Desktop/pserso-ai-devrel/README.md:*)",
       "Bash(grep -r \"GOOGLE\\\\|NEXTAUTH\\\\|AUTH\" /c/Users/User/Desktop/pserso-ai-devrel/.env* --include=*)",
       "Bash(grep -h process.env.w+ /c/Users/User/Desktop/pserso-ai-devrel/lib/*.ts /c/Users/User/Desktop/pserso-ai-devrel/auth.ts)",
-      "Bash(grep -r \"4\\\\.5\\\\|4500\" /c/Users/User/Desktop/pserso-ai-devrel --include=*.ts --include=*.tsx --include=*.md)"
+      "Bash(grep -r \"4\\\\.5\\\\|4500\" /c/Users/User/Desktop/pserso-ai-devrel --include=*.ts --include=*.tsx --include=*.md)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(npm run:*)",
+      "Bash(git pull:*)",
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "Bash(grep -E \"\\\\.\\(tsx?|json\\)$\")"
     ]
   }
 }

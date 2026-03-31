@@ -474,6 +474,7 @@ export default function DubForm() {
   const [subtitleIndex, setSubtitleIndex] = useState<number>(0);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [videoDownloadNotice, setVideoDownloadNotice] = useState<string | null>(null);
+  const [cropWarning, setCropWarning] = useState<string | null>(null);
   // 영상이 MediaRecorder 로 실제 크롭된 경우 true → 플레이어 start=0 기준
   const [videoCropped, setVideoCropped] = useState<boolean>(false);
   const [isCroppingVideo, setIsCroppingVideo] = useState<boolean>(false);
@@ -619,6 +620,7 @@ export default function DubForm() {
     setPlaybackMode("dubbed");
     setVideoCropped(false);
     setIsCroppingVideo(false);
+    setCropWarning(null);
 
     if (origUrlRef.current) {
       URL.revokeObjectURL(origUrlRef.current);
@@ -710,6 +712,7 @@ export default function DubForm() {
     setError(null);
     setResult(null);
     setAudioUrl(null);
+    setCropWarning(null);
 
     const isVideo = file.type.startsWith("video/");
     const needsExtract = isVideo || cropStart > 0 || cropEnd < (fileDuration ?? Infinity);
@@ -762,8 +765,11 @@ export default function DubForm() {
     form.append("audio", uploadBlob, uploadFilename);
     form.append("targetLanguage", targetLanguage);
 
+    const fetchAbort = new AbortController();
+    const fetchTimeout = setTimeout(() => fetchAbort.abort(), 90_000);
     try {
-      const res = await fetch("/api/dub", { method: "POST", body: form });
+      const res = await fetch("/api/dub", { method: "POST", body: form, signal: fetchAbort.signal });
+      clearTimeout(fetchTimeout);
       const data = await res.json();
 
       if (!res.ok) {
@@ -787,16 +793,22 @@ export default function DubForm() {
           origUrlRef.current = newUrl;
           setOriginalUrl(newUrl);
           setVideoCropped(true);
+        } else if (isVideo && (snapStart > 0 || snapEnd < (fileDuration ?? Infinity))) {
+          setCropWarning("영상 크롭에 실패했습니다. 전체 영상으로 더빙이 재생됩니다.");
         }
         setIsCroppingVideo(false);
         setStatus("done");
       }
     } catch (err) {
+      clearTimeout(fetchTimeout);
       // API 에러 시 크롭 프로미스의 미처리 거부만 억제 (blob은 GC에 맡김)
       cropPromise.catch(() => {});
       if (!abortCtrl.cancelled) setIsCroppingVideo(false);
 
-      const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
+      const isTimeout = err instanceof Error && err.name === "AbortError";
+      const message = isTimeout
+        ? "요청 시간이 초과되었습니다 (90초). 파일이 너무 크거나 네트워크가 느린 경우 발생합니다."
+        : err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
       setError(message);
       setStatus("error");
       setStep(-1);
@@ -830,7 +842,8 @@ export default function DubForm() {
     }
 
     setIsRecording(true);
-    const audioCtx = new AudioContext();
+    let audioCtx: AudioContext | null = null;
+    let rafId = 0;
     try {
       const video = document.createElement("video");
       video.src = originalUrl;
@@ -854,20 +867,21 @@ export default function DubForm() {
       canvas.height = video.videoHeight || 720;
       const ctx = canvas.getContext("2d")!;
 
-      const subtitleChunks = result ? buildSubtitleChunks(result.translation) : [];
       const startPos = videoCropped ? 0 : cropStart;
-      const dur = cropEnd - cropStart;
-
-      let rafId = 0;
+      // 세그먼트 타임스탬프 기반 자막 윈도우 (assembleTimedAudio와 동일한 타이밍)
+      const segs = result?.segments ?? [];
+      const subtitleWindows = segs.map((seg, i) => ({
+        start: seg.start,
+        end: i + 1 < segs.length ? segs[i + 1].start : Infinity,
+        text: seg.translation,
+      }));
       const drawFrame = () => {
         if (video.readyState >= 2) {
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          if (showSubtitles && subtitleChunks.length > 0) {
+          if (showSubtitles && subtitleWindows.length > 0) {
             const elapsed = video.currentTime - startPos;
-            const p = Math.max(0, Math.min(1, elapsed / Math.max(1, dur)));
-            const idx = Math.min(Math.floor(p * subtitleChunks.length), subtitleChunks.length - 1);
-            const subtitle = subtitleChunks[idx];
-            if (subtitle) drawSubtitle(ctx, subtitle, canvas.width, canvas.height);
+            const activeSeg = subtitleWindows.find(s => elapsed >= s.start && elapsed < s.end);
+            if (activeSeg) drawSubtitle(ctx, activeSeg.text, canvas.width, canvas.height);
           }
         }
         rafId = requestAnimationFrame(drawFrame);
@@ -881,6 +895,7 @@ export default function DubForm() {
       if ("captureStream" in audio) {
         audioTracks = (audio as any).captureStream().getAudioTracks();
       } else {
+        audioCtx = new AudioContext();
         const audioSrc = audioCtx.createMediaElementSource(audio);
         const audioDest = audioCtx.createMediaStreamDestination();
         audioSrc.connect(audioDest);
@@ -904,7 +919,7 @@ export default function DubForm() {
       recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
       recorder.onstop = async () => {
         cancelAnimationFrame(rafId);
-        await audioCtx.close();
+        await audioCtx?.close();
         const blob = new Blob(chunks, { type: mimeType });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -927,8 +942,8 @@ export default function DubForm() {
       }, (cropEnd - cropStart + 2) * 1000);
     } catch (e) {
       console.error("[video download]", e);
-      cancelAnimationFrame(0);
-      await audioCtx.close();
+      cancelAnimationFrame(rafId);
+      await audioCtx?.close();
       setIsRecording(false);
       handleDownload();
     }
@@ -974,10 +989,12 @@ export default function DubForm() {
           <button
             type="button"
             onClick={() => {
+              const url = URL.createObjectURL(new Blob([result.transcript], { type: "text/plain" }));
               const a = document.createElement("a");
-              a.href = URL.createObjectURL(new Blob([result.transcript], { type: "text/plain" }));
+              a.href = url;
               a.download = "transcript.txt";
               a.click();
+              setTimeout(() => URL.revokeObjectURL(url), 2000);
             }}
             className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
           >
@@ -1000,10 +1017,12 @@ export default function DubForm() {
           <button
             type="button"
             onClick={() => {
+              const url = URL.createObjectURL(new Blob([result.translation], { type: "text/plain" }));
               const a = document.createElement("a");
-              a.href = URL.createObjectURL(new Blob([result.translation], { type: "text/plain" }));
+              a.href = url;
               a.download = `translation_${targetLanguage.toLowerCase()}.txt`;
               a.click();
+              setTimeout(() => URL.revokeObjectURL(url), 2000);
             }}
             className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
           >
@@ -1359,7 +1378,15 @@ export default function DubForm() {
             <p className="text-sm font-semibold text-red-700 mb-1">오류가 발생했습니다</p>
             <p className="whitespace-pre-wrap text-sm text-red-600">{error}</p>
             <p className="mt-2.5 text-xs text-red-400">
-              다른 파일 형식으로 시도하거나, 더 짧은 오디오 파일을 업로드해 보세요.
+              {/너무 많습니다|rate.limit|429/i.test(error)
+                ? "잠시 기다린 후 다시 시도해 주세요."
+                : /크레딧|quota|402|소진/i.test(error)
+                ? "서비스 제공자의 API 크레딧을 확인해 주세요."
+                : /API 키|인증|auth|401|403/i.test(error)
+                ? "환경 변수(.env.local)의 API 키를 확인해 주세요."
+                : /시간이 초과/i.test(error)
+                ? "파일 크기를 줄이거나 네트워크 상태를 확인해 주세요."
+                : "다른 파일 형식으로 시도하거나, 더 짧은 오디오 파일을 업로드해 보세요."}
             </p>
           </div>
         )}
@@ -1501,6 +1528,9 @@ export default function DubForm() {
                 <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-200 border-t-amber-600" />
                 영상 크롭 중…
               </span>
+            )}
+            {!isCroppingVideo && cropWarning && (
+              <span className="ml-auto text-[11px] text-amber-600">{cropWarning}</span>
             )}
           </div>
 
