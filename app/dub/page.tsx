@@ -46,7 +46,7 @@ export default async function DubPage() {
           </p>
         </div>
 
-        <div className="w-full max-w-[560px]">
+        <div className="w-full max-w-[560px] md:max-w-[1080px]">
           <DubForm />
         </div>
       </div>

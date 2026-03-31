@@ -57,7 +57,7 @@ function encodeWAV(buffer: AudioBuffer): Blob {
   const numCh = buffer.numberOfChannels;
   const sr = buffer.sampleRate;
   const numSamples = buffer.length;
-  const bps = 2; // 16-bit PCM
+  const bps = 2;
   const dataLen = numCh * numSamples * bps;
   const ab = new ArrayBuffer(44 + dataLen);
   const v = new DataView(ab);
@@ -70,7 +70,7 @@ function encodeWAV(buffer: AudioBuffer): Blob {
   ws(8, "WAVE");
   ws(12, "fmt ");
   v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true);       // PCM
+  v.setUint16(20, 1, true);
   v.setUint16(22, numCh, true);
   v.setUint32(24, sr, true);
   v.setUint32(28, sr * numCh * bps, true);
@@ -110,7 +110,6 @@ async function extractAndCropAudio(
 ): Promise<Blob> {
   const arrayBuffer = await file.arrayBuffer();
 
-  // 디코딩 후 즉시 AudioContext 닫아 모바일 오디오 하드웨어 자원 해제
   const ctx = new AudioContext();
   let decoded: AudioBuffer;
   try {
@@ -119,7 +118,6 @@ async function extractAndCropAudio(
     await ctx.close();
   }
 
-  // 실제 길이에 맞게 범위 보정
   const clampedStart = Math.max(0, Math.min(startSec, decoded.duration));
   const clampedEnd = Math.max(clampedStart + 0.1, Math.min(endSec, decoded.duration));
   const cropDuration = clampedEnd - clampedStart;
@@ -131,11 +129,120 @@ async function extractAndCropAudio(
   const src = offCtx.createBufferSource();
   src.buffer = decoded;
   src.connect(offCtx.destination);
-  // offset: 버퍼 내 시작 지점(초), duration: 재생할 길이(초)
   src.start(0, clampedStart, cropDuration);
 
   const rendered = await offCtx.startRendering();
   return encodeWAV(rendered);
+}
+
+/** VTT 타임스탬프 형식: "HH:MM:SS.mmm" */
+function formatVTTTime(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return (
+    String(h).padStart(2, "0") + ":" +
+    String(m).padStart(2, "0") + ":" +
+    s.toFixed(3).padStart(6, "0")
+  );
+}
+
+/**
+ * 자막 청크 배열로 WebVTT 문자열 생성.
+ * startOffset: 크롭 시작 시각(초) — 영상의 currentTime 기준에 맞게 오프셋.
+ * totalDuration: 크롭 구간 길이(초) — 자막을 이 구간 전체에 고르게 분배.
+ */
+function buildVTT(chunks: string[], totalDuration: number, startOffset: number): string {
+  const dur = Math.max(totalDuration, 1);
+  const chunkDur = dur / Math.max(chunks.length, 1);
+  let vtt = "WEBVTT\n\n";
+  chunks.forEach((chunk, i) => {
+    const start = startOffset + i * chunkDur;
+    const end = startOffset + (i + 1) * chunkDur;
+    vtt += `${formatVTTTime(start)} --> ${formatVTTTime(end)}\n${chunk}\n\n`;
+  });
+  return vtt;
+}
+
+/**
+ * 번역 텍스트를 2문장씩 묶어 자막 청크 배열로 분할한다.
+ * 문장 구분이 없으면 약 60자 단위로 분할.
+ */
+function buildSubtitleChunks(text: string): string[] {
+  const sentences = text
+    .replace(/([.!?。！？])\s*/g, "$1\n")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (sentences.length <= 1) {
+    // 구두점이 없는 텍스트: 60자 단위로 분할
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += 60) {
+      chunks.push(text.slice(i, i + 60).trim());
+    }
+    return chunks.filter(Boolean);
+  }
+
+  // 2문장씩 묶기
+  const chunks: string[] = [];
+  for (let i = 0; i < sentences.length; i += 2) {
+    chunks.push(sentences.slice(i, i + 2).join(" "));
+  }
+  return chunks;
+}
+
+/**
+ * video(음소거)와 audio(더빙)를 크롭 구간 [start, end] 내에서 동기화한다.
+ * - 영상이 start 이전으로 스크럽되면 audio를 0으로 클램프
+ * - 영상이 end를 넘으면 일시정지 후 start로 되감기
+ * cleanup 함수를 반환한다.
+ */
+function attachDubSync(
+  video: HTMLVideoElement,
+  audio: HTMLAudioElement,
+  start: number,
+  end: number,
+  dur: number | null,
+): () => void {
+  // 메타데이터 로드 후 크롭 시작 지점으로 이동
+  const onLoaded = () => { if (start > 0) video.currentTime = start; };
+  if (video.readyState >= 1) {
+    if (start > 0) video.currentTime = start;
+  } else {
+    video.addEventListener("loadedmetadata", onLoaded);
+  }
+
+  // video.currentTime 기준으로 더빙 오디오 오프셋 계산
+  const onPlay = () => {
+    audio.currentTime = Math.max(0, video.currentTime - start);
+    audio.play();
+  };
+  const onPause = () => audio.pause();
+  const onSeeked = () => {
+    audio.currentTime = Math.max(0, video.currentTime - start);
+  };
+  // 크롭 끝 지점 도달 시 멈추고 시작 지점으로 복귀
+  const onTimeUpdate = () => {
+    if (dur !== null && end < dur && video.currentTime >= end) {
+      video.pause();
+      video.currentTime = start;
+      audio.currentTime = 0;
+    }
+  };
+
+  video.addEventListener("play", onPlay);
+  video.addEventListener("pause", onPause);
+  video.addEventListener("seeked", onSeeked);
+  video.addEventListener("timeupdate", onTimeUpdate);
+
+  return () => {
+    video.removeEventListener("loadedmetadata", onLoaded);
+    video.removeEventListener("play", onPlay);
+    video.removeEventListener("pause", onPause);
+    video.removeEventListener("seeked", onSeeked);
+    video.removeEventListener("timeupdate", onTimeUpdate);
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -143,21 +250,15 @@ async function extractAndCropAudio(
 export default function DubForm() {
   const [file, setFile] = useState<File | null>(null);
   const [fileDuration, setFileDuration] = useState<number | null>(null);
-
-  // 크롭 범위 (초 단위)
   const [cropStart, setCropStart] = useState<number>(0);
   const [cropEnd, setCropEnd] = useState<number>(CROP_LIMIT_SEC);
-
   const [targetLanguage, setTargetLanguage] = useState<string>(SUPPORTED_LANGUAGES[0].code);
-
-  // 번역 자막 표시 여부
   const [showSubtitles, setShowSubtitles] = useState<boolean>(true);
-
-  // 멀티 재생 탭: 원본 / 더빙
+  const [subtitleIndex, setSubtitleIndex] = useState<number>(0);
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [vttUrl, setVttUrl] = useState<string | null>(null);
   const [playbackMode, setPlaybackMode] = useState<"original" | "dubbed">("dubbed");
-
   const [status, setStatus] = useState<Status>("idle");
-  // -1 = 대기, 0 = 파일 확인, 1 = 추출/전처리, 2 = 서버 처리
   const [step, setStep] = useState<number>(-1);
   const [result, setResult] = useState<DubResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -165,45 +266,102 @@ export default function DubForm() {
   const [originalUrl, setOriginalUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
-  // 더빙 탭: 영상 ↔ 더빙 오디오 동기화용 ref
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const dubAudioRef = useRef<HTMLAudioElement>(null);
+  // 더빙 video ↔ audio 동기화용 refs
+  const videoRef = useRef<HTMLVideoElement>(null);          // 데스크탑 더빙 video
+  const dubAudioRef = useRef<HTMLAudioElement>(null);       // 데스크탑 더빙 audio
+  const mobileVideoRef = useRef<HTMLVideoElement>(null);    // 모바일 더빙 video
+  const mobileDubAudioRef = useRef<HTMLAudioElement>(null); // 모바일 더빙 audio
 
-  // Blob URL 정리용 ref
   const blobUrlRef = useRef<string | null>(null);
   const origUrlRef = useRef<string | null>(null);
+  const vttUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     return () => {
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
       if (origUrlRef.current) URL.revokeObjectURL(origUrlRef.current);
+      if (vttUrlRef.current) URL.revokeObjectURL(vttUrlRef.current);
     };
   }, []);
 
-  // 더빙 탭: <video>(음소거) 재생 이벤트 → <audio>(더빙) 동기화
+  // 데스크탑 더빙 패널: 크롭 구간 동기화
   useEffect(() => {
     const video = videoRef.current;
     const audio = dubAudioRef.current;
-    if (!video || !audio || playbackMode !== "dubbed") return;
+    if (!video || !audio) return;
+    return attachDubSync(video, audio, cropStart, cropEnd, fileDuration);
+  }, [audioUrl, cropStart, cropEnd, fileDuration]);
 
-    const onPlay = () => { audio.currentTime = video.currentTime; audio.play(); };
-    const onPause = () => audio.pause();
-    const onSeeked = () => { audio.currentTime = video.currentTime; };
+  // 모바일 더빙 탭: 크롭 구간 동기화
+  useEffect(() => {
+    const video = mobileVideoRef.current;
+    const audio = mobileDubAudioRef.current;
+    if (!video || !audio) return;
+    return attachDubSync(video, audio, cropStart, cropEnd, fileDuration);
+  }, [audioUrl, cropStart, cropEnd, fileDuration]);
 
-    video.addEventListener("play", onPlay);
-    video.addEventListener("pause", onPause);
-    video.addEventListener("seeked", onSeeked);
-    return () => {
-      video.removeEventListener("play", onPlay);
-      video.removeEventListener("pause", onPause);
-      video.removeEventListener("seeked", onSeeked);
+  // 결과가 바뀌면 자막 인덱스 초기화
+  useEffect(() => { setSubtitleIndex(0); }, [result]);
+
+  // 번역 결과 → WebVTT Blob 생성
+  // cropStart 오프셋 + 크롭 구간 전체(cropEnd - cropStart)에 고르게 분배하여
+  // 영상 currentTime과 자막 타이밍이 항상 일치하도록 함
+  useEffect(() => {
+    if (vttUrlRef.current) {
+      URL.revokeObjectURL(vttUrlRef.current);
+      vttUrlRef.current = null;
+    }
+    setVttUrl(null);
+    if (!result) return;
+
+    const chunks = buildSubtitleChunks(result.translation);
+    const duration = Math.max(cropEnd - cropStart, 1);
+    const blob = new Blob([buildVTT(chunks, duration, cropStart)], { type: "text/vtt" });
+    const url = URL.createObjectURL(blob);
+    vttUrlRef.current = url;
+    setVttUrl(url);
+  }, [result, cropStart, cropEnd]);
+
+  // showSubtitles 토글 → 모든 video 요소의 track.mode 갱신
+  useEffect(() => {
+    [videoRef, mobileVideoRef].forEach((ref) => {
+      const video = ref.current;
+      if (!video) return;
+      const tracks = video.textTracks;
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].mode = showSubtitles ? "showing" : "hidden";
+      }
+    });
+  }, [showSubtitles, vttUrl]);
+
+  // 데스크탑 더빙 영상: timeupdate → 자막 인덱스 갱신
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !result) return;
+    const chunks = buildSubtitleChunks(result.translation);
+    const update = () => {
+      const elapsed = video.currentTime - cropStart;
+      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, cropEnd - cropStart)));
+      setSubtitleIndex(Math.min(Math.floor(p * chunks.length), chunks.length - 1));
     };
-  }, [playbackMode, audioUrl]);
+    video.addEventListener("timeupdate", update);
+    return () => video.removeEventListener("timeupdate", update);
+  }, [audioUrl, result, cropStart, cropEnd]);
 
-  /**
-   * 파일 선택/해제. 메타데이터 탐색 + 원본 URL 생성.
-   * iOS Safari는 <audio> 보다 <video> 엘리먼트로 메타데이터를 더 안정적으로 읽음.
-   */
+  // 모바일 더빙 영상: timeupdate → 자막 인덱스 갱신
+  useEffect(() => {
+    const video = mobileVideoRef.current;
+    if (!video || !result) return;
+    const chunks = buildSubtitleChunks(result.translation);
+    const update = () => {
+      const elapsed = video.currentTime - cropStart;
+      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, cropEnd - cropStart)));
+      setSubtitleIndex(Math.min(Math.floor(p * chunks.length), chunks.length - 1));
+    };
+    video.addEventListener("timeupdate", update);
+    return () => video.removeEventListener("timeupdate", update);
+  }, [audioUrl, result, cropStart, cropEnd]);
+
   const selectFile = async (selected: File | null) => {
     setFile(selected);
     setFileDuration(null);
@@ -215,7 +373,6 @@ export default function DubForm() {
     setAudioUrl(null);
     setPlaybackMode("dubbed");
 
-    // 이전 원본 URL 해제
     if (origUrlRef.current) {
       URL.revokeObjectURL(origUrlRef.current);
       origUrlRef.current = null;
@@ -224,7 +381,6 @@ export default function DubForm() {
 
     if (!selected) return;
 
-    // 원본 파일 Blob URL — 메타데이터 탐색 + 멀티 재생 플레이어 공용
     const origUrl = URL.createObjectURL(selected);
     origUrlRef.current = origUrl;
     setOriginalUrl(origUrl);
@@ -237,13 +393,12 @@ export default function DubForm() {
 
     await new Promise<void>((resolve) => {
       el.onloadedmetadata = () => resolve();
-      el.onerror = () => resolve(); // 탐색 실패 시 무시 (슬라이더 미표시)
+      el.onerror = () => resolve();
     });
 
     if (Number.isFinite(el.duration)) {
       const dur = el.duration;
       setFileDuration(dur);
-      // 기본 크롭 끝 지점: 파일 길이와 60초 중 작은 값
       setCropEnd(Math.min(dur, CROP_LIMIT_SEC));
     }
   };
@@ -266,14 +421,12 @@ export default function DubForm() {
     await selectFile(e.dataTransfer.files[0] ?? null);
   };
 
-  // 시작 슬라이더: 끝보다 1초 이상 앞, 범위 60초 초과 시 끝 자동 조정
   const handleCropStartChange = (val: number) => {
     const newStart = Math.min(val, cropEnd - 1);
     setCropStart(newStart);
     if (cropEnd - newStart > CROP_LIMIT_SEC) setCropEnd(newStart + CROP_LIMIT_SEC);
   };
 
-  // 끝 슬라이더: 시작보다 1초 이상 뒤, 범위 60초 초과 시 시작 자동 조정
   const handleCropEndChange = (val: number) => {
     const newEnd = Math.max(val, cropStart + 1);
     setCropEnd(newEnd);
@@ -310,8 +463,6 @@ export default function DubForm() {
     setAudioUrl(null);
 
     const isVideo = file.type.startsWith("video/");
-    // 추출 필요 여부: 영상이거나 / 시작이 0이 아니거나 / 끝이 파일 길이보다 짧은 경우
-    // fileDuration을 알 수 없으면 cropEnd(기본 60초)가 Infinity보다 작으므로 항상 추출
     const needsExtract = isVideo || cropStart > 0 || cropEnd < (fileDuration ?? Infinity);
 
     let uploadBlob: Blob = file;
@@ -325,7 +476,6 @@ export default function DubForm() {
       } catch (extractErr) {
         console.error("[extract] failed:", extractErr);
         if (isVideo) {
-          // 영상 오디오 추출 실패: 하드 스탑 (서버는 영상 파일 처리 불가)
           setError(
             "이 영상에서 오디오를 추출하지 못했습니다. " +
             "MP4 또는 WebM 파일인지 확인하거나, 오디오 파일을 직접 업로드해 보세요.\n" +
@@ -335,7 +485,6 @@ export default function DubForm() {
           setStep(-1);
           return;
         }
-        // 오디오 크롭 실패: 원본 파일로 폴백
         console.warn("[audio crop] failed, falling back to original:", extractErr);
         uploadBlob = file;
         uploadFilename = file.name;
@@ -378,490 +527,697 @@ export default function DubForm() {
     a.click();
   };
 
+  /**
+   * 영상 다운로드: 원본 영상(음소거) + 더빙 오디오를 MediaRecorder로 실시간 합성.
+   * captureStream 미지원 브라우저(Firefox 일부, iOS Safari)에서는 MP3 폴백.
+   */
+  const handleVideoDownload = async () => {
+    if (!originalUrl || !audioUrl) return;
+
+    const testEl = document.createElement("video");
+    if (!("captureStream" in testEl)) {
+      // 미지원 → MP3 다운로드로 폴백
+      handleDownload();
+      return;
+    }
+
+    setIsRecording(true);
+    try {
+      const video = document.createElement("video");
+      video.src = originalUrl;
+      video.muted = true;
+      (video as HTMLVideoElement & { playsInline: boolean }).playsInline = true;
+
+      const audio = document.createElement("audio");
+      audio.src = audioUrl;
+
+      // 메타데이터 로드 대기
+      await Promise.all([
+        new Promise<void>((r) => { video.oncanplay = () => r(); video.load(); }),
+        new Promise<void>((r) => { audio.oncanplay = () => r(); audio.load(); }),
+      ]);
+
+      video.currentTime = cropStart;
+      audio.currentTime = 0;
+
+      const videoStream = (video as unknown as { captureStream: () => MediaStream }).captureStream();
+      const audioCtx = new AudioContext();
+      const audioSrc = audioCtx.createMediaElementSource(audio);
+      const audioDest = audioCtx.createMediaStreamDestination();
+      audioSrc.connect(audioDest);
+
+      const combined = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...audioDest.stream.getAudioTracks(),
+      ]);
+
+      const mimeType =
+        MediaRecorder.isTypeSupported("video/mp4")
+          ? "video/mp4"
+          : "video/webm";
+
+      const recorder = new MediaRecorder(combined, { mimeType });
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        await audioCtx.close();
+        const ext = mimeType === "video/mp4" ? "mp4" : "webm";
+        const blob = new Blob(chunks, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `dubbed_${targetLanguage.toLowerCase()}.${ext}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        setIsRecording(false);
+      };
+
+      recorder.start(250);
+      await Promise.all([video.play(), audio.play()]);
+
+      // 더빙 오디오 종료 시 녹화 중단 (더빙 = 크롭 구간 길이)
+      audio.onended = () => {
+        video.pause();
+        if (recorder.state === "recording") recorder.stop();
+      };
+      // 안전 타임아웃
+      setTimeout(() => {
+        if (recorder.state === "recording") { video.pause(); audio.pause(); recorder.stop(); }
+      }, (cropEnd - cropStart + 2) * 1000);
+    } catch (e) {
+      console.error("[video download]", e);
+      setIsRecording(false);
+      handleDownload(); // 실패 시 MP3 폴백
+    }
+  };
+
   const selectedLabel =
     SUPPORTED_LANGUAGES.find((l) => l.code === targetLanguage)?.label ?? targetLanguage;
   const isVideoFile = file?.type.startsWith("video/") ?? false;
   const cropDuration = cropEnd - cropStart;
-  // 슬라이더 표시: 길이를 알고 있고 2초 이상인 파일
   const showCropSlider = fileDuration !== null && fileDuration >= 2;
 
-  return (
-    <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+  // 크롭 구간이 있으면 Media Fragments URI (#t=start,end) 를 붙여
+  // 브라우저 내장 seekbar 가 크롭 범위만 표시하도록 한다.
+  // currentTime 은 여전히 원본 절대 초 기준이므로 attachDubSync 와 호환된다.
+  const isCropped =
+    cropStart > 0 || (fileDuration !== null && cropEnd < fileDuration);
+  const videoSrc = originalUrl
+    ? isCropped
+      ? `${originalUrl}#t=${cropStart},${cropEnd}`
+      : originalUrl
+    : null;
 
-      {/* ── Step 1: 파일 선택 ──────────────────────────────────────────────── */}
-      <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
-        <div className="flex items-center gap-3 mb-4">
-          <span className="w-7 h-7 rounded-lg bg-[rgba(37,99,235,0.1)] text-blue-600 text-[13px] font-bold flex items-center justify-center flex-shrink-0">
-            01
-          </span>
-          <div>
-            <p className="text-sm font-semibold text-[#1a1917]">파일 선택</p>
-            <p className="text-xs text-[#a8a29e]">오디오 또는 영상 파일을 업로드하세요</p>
-          </div>
-        </div>
+  // 현재 재생 위치에 해당하는 2줄짜리 자막
+  const subtitleChunks = result ? buildSubtitleChunks(result.translation) : [];
+  const currentSubtitle = subtitleChunks[subtitleIndex] ?? "";
 
-        {!file ? (
-          <label
-            className={`flex flex-col items-center gap-3 w-full cursor-pointer rounded-xl border-[1.5px] border-dashed py-8 px-4 text-center transition-all duration-150 ${
-              isDragging
-                ? "border-blue-400 bg-[rgba(37,99,235,0.06)]"
-                : "border-[#d0cfc9] hover:border-blue-500 hover:bg-[rgba(37,99,235,0.04)]"
-            }`}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            <div className={`w-11 h-11 rounded-xl border flex items-center justify-center text-xl transition-all ${
-              isDragging
-                ? "bg-[rgba(37,99,235,0.07)] border-[rgba(37,99,235,0.25)]"
-                : "bg-[#f5f4f0] border-[#e4e3df]"
-            }`}>
-              🎵
-            </div>
-            <div>
-              <p className="text-sm font-medium text-[#1a1917] mb-0.5">
-                {isDragging ? "여기에 놓으세요" : (
-                  <><span className="text-blue-600">파일 선택</span> 또는 드래그 앤 드롭</>
-                )}
-              </p>
-              <p className="text-xs text-[#a8a29e]">최대 60초 구간을 직접 선택할 수 있습니다</p>
-            </div>
-            <div className="flex flex-wrap justify-center gap-1.5">
-              {["MP3", "WAV", "M4A", "FLAC", "OGG", "MP4", "WebM"].map((f) => (
-                <span
-                  key={f}
-                  className="bg-[#f5f4f0] border border-[#e4e3df] rounded-md px-2 py-0.5 text-[11px] font-medium text-[#a8a29e] tracking-wide"
-                >
-                  {f}
-                </span>
-              ))}
-            </div>
-            <input
-              type="file"
-              accept="audio/*,video/mp4,video/webm,video/quicktime"
-              onChange={handleFileChange}
-              className="sr-only"
-            />
-          </label>
-        ) : (
-          <div className="flex items-center gap-3 bg-[rgba(37,99,235,0.06)] border border-[rgba(37,99,235,0.2)] rounded-xl px-4 py-3.5">
-            <span className="text-2xl">{isVideoFile ? "🎬" : "🎵"}</span>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-[#1a1917] truncate">{file.name}</p>
-              <p className="text-xs text-[#a8a29e]">
-                {(file.size / 1024 / 1024).toFixed(1)} MB
-                {fileDuration !== null && ` · 전체 ${formatTime(fileDuration)}`}
-                {isVideoFile && " · 영상"}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => selectFile(null)}
-              className="text-[#a8a29e] hover:text-[#1a1917] hover:bg-black/5 rounded-lg p-1.5 transition-colors text-xl leading-none"
-            >
-              ×
-            </button>
-          </div>
-        )}
+  // ── 공통 UI 조각 ────────────────────────────────────────────────────────────
 
-        {/* ── 크롭 범위 슬라이더 ──────────────────────────────────────────── */}
-        {file && showCropSlider && (
-          <div className="mt-4 bg-[#f5f4f0] rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <p className="text-xs font-semibold text-[#57534e]">처리 구간 선택</p>
-              <span className="text-xs font-medium text-blue-600 bg-blue-50 border border-blue-100 rounded-lg px-2 py-0.5 tabular-nums">
-                {formatTime(cropStart)} ~ {formatTime(cropEnd)}
-                <span className="text-blue-400 ml-1">({Math.round(cropDuration)}초)</span>
+  // 결과 섹션 (텍스트 + 다운로드) — 좌측 컬럼 + 모바일 모두 사용
+  const resultTextPanel = result && (
+    <div className="flex flex-col gap-4">
+      {/* 원문 전사 */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e]">
+            원문 전사
+            {result.detectedLanguage && (
+              <span className="ml-2 normal-case text-blue-400">
+                {LANGUAGE_NAMES[result.detectedLanguage] ?? result.detectedLanguage}
               </span>
-            </div>
-
-            <div className="flex flex-col gap-4">
-              {/* 시작 지점 */}
-              <div>
-                <div className="flex justify-between mb-1.5">
-                  <label className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide">
-                    시작
-                  </label>
-                  <span className="text-[11px] font-semibold text-[#57534e] tabular-nums">
-                    {formatTime(cropStart)}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, Math.floor(fileDuration) - 1)}
-                  step={1}
-                  value={cropStart}
-                  onChange={(e) => handleCropStartChange(Number(e.target.value))}
-                  className="w-full h-2 accent-blue-600 cursor-pointer"
-                />
-              </div>
-
-              {/* 끝 지점 */}
-              <div>
-                <div className="flex justify-between mb-1.5">
-                  <label className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide">
-                    끝
-                  </label>
-                  <span className="text-[11px] font-semibold text-[#57534e] tabular-nums">
-                    {formatTime(cropEnd)}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={Math.ceil(fileDuration)}
-                  step={1}
-                  value={cropEnd}
-                  onChange={(e) => handleCropEndChange(Number(e.target.value))}
-                  className="w-full h-2 accent-blue-600 cursor-pointer"
-                />
-              </div>
-            </div>
-
-            {cropDuration > CROP_LIMIT_SEC && (
-              <p className="text-xs text-amber-600 mt-2.5">
-                ⚠ 최대 60초까지 선택할 수 있습니다. 범위를 줄여 주세요.
-              </p>
             )}
-          </div>
-        )}
-      </div>
-
-      {/* ── Step 2: 목표 언어 + 자막 설정 ─────────────────────────────────── */}
-      <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
-        <div className="flex items-center gap-3 mb-4">
-          <span className="w-7 h-7 rounded-lg bg-[rgba(37,99,235,0.1)] text-blue-600 text-[13px] font-bold flex items-center justify-center flex-shrink-0">
-            02
-          </span>
-          <div>
-            <p className="text-sm font-semibold text-[#1a1917]">목표 언어</p>
-            <p className="text-xs text-[#a8a29e]">원본 언어는 자동으로 감지됩니다</p>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-[1fr_40px_1fr] items-end gap-2">
-          <div>
-            <label className="block text-[11px] font-medium text-[#a8a29e] uppercase tracking-widest mb-1.5">
-              원본
-            </label>
-            <div className="w-full border border-[#e4e3df] rounded-xl px-3 py-2.5 text-sm font-medium text-[#a8a29e] bg-[#f5f4f0] select-none">
-              자동 감지
-            </div>
-          </div>
-          <div className="flex items-center justify-center h-[42px] text-[#a8a29e] text-base">
-            →
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[#a8a29e] uppercase tracking-widest mb-1.5">
-              목표
-            </label>
-            <select
-              value={targetLanguage}
-              onChange={(e) => setTargetLanguage(e.target.value)}
-              className="w-full border-[1.5px] border-[#e4e3df] rounded-xl px-3 py-2.5 text-sm font-medium text-[#1a1917] bg-[#f5f4f0] focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 focus:outline-none cursor-pointer transition-all appearance-none"
-            >
-              {SUPPORTED_LANGUAGES.map((lang) => (
-                <option key={lang.code} value={lang.code}>
-                  {lang.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        {/* 번역 자막 토글 */}
-        <div className="mt-4 pt-4 border-t border-[#e4e3df]">
+          </p>
           <button
             type="button"
-            onClick={() => setShowSubtitles((v) => !v)}
-            className="flex items-center gap-3 w-full text-left group"
+            onClick={() => {
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(new Blob([result.transcript], { type: "text/plain" }));
+              a.download = "transcript.txt";
+              a.click();
+            }}
+            className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
           >
-            {/* 토글 스위치 */}
-            <div
-              className={`relative flex-shrink-0 w-9 h-5 rounded-full transition-colors duration-200 ${
-                showSubtitles ? "bg-blue-600" : "bg-[#d0cfc9]"
-              }`}
+            ↓ txt
+          </button>
+        </div>
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#57534e] bg-[#f5f4f0] rounded-xl px-4 py-3">
+          {result.transcript}
+        </p>
+      </div>
+
+      <div className="h-px bg-[#e4e3df]" />
+
+      {/* 번역 */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e]">
+            번역 — {selectedLabel}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(new Blob([result.translation], { type: "text/plain" }));
+              a.download = `translation_${targetLanguage.toLowerCase()}.txt`;
+              a.click();
+            }}
+            className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
+          >
+            ↓ txt
+          </button>
+        </div>
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#57534e] bg-[#f5f4f0] rounded-xl px-4 py-3">
+          {result.translation}
+        </p>
+      </div>
+
+      <div className="h-px bg-[#e4e3df]" />
+
+      {/* 다운로드 */}
+      <div>
+        <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e] mb-2.5">
+          더빙 다운로드
+        </p>
+        <div className="flex flex-col gap-2">
+          {/* 영상 다운로드 (영상 파일인 경우만) */}
+          {isVideoFile && (
+            <button
+              type="button"
+              onClick={handleVideoDownload}
+              disabled={isRecording}
+              className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-[#93c5fd] text-white rounded-xl px-4 py-3 text-sm font-medium transition-all disabled:cursor-not-allowed"
             >
-              <span
-                className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-transform duration-200 ${
-                  showSubtitles ? "translate-x-4" : ""
-                }`}
-              />
-            </div>
-            <div>
-              <p className="text-sm font-medium text-[#1a1917] group-hover:text-blue-600 transition-colors">
-                번역 자막 표시
-              </p>
-              <p className="text-xs text-[#a8a29e]">
-                더빙 재생 시 번역문을 자막으로 표시합니다
-              </p>
-            </div>
+              {isRecording ? (
+                <>
+                  <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                  영상 합성 중… (재생 시간만큼 소요)
+                </>
+              ) : (
+                "↓ 영상 다운로드 (더빙 합성)"
+              )}
+            </button>
+          )}
+          {/* MP3 다운로드 */}
+          <button
+            type="button"
+            onClick={handleDownload}
+            className="w-full flex items-center justify-center gap-2 bg-[#f5f4f0] border-[1.5px] border-[#d0cfc9] rounded-xl px-4 py-3 text-sm font-medium text-[#1a1917] hover:border-blue-500 hover:bg-[rgba(37,99,235,0.04)] hover:text-blue-600 transition-all"
+          >
+            ↓ MP3 다운로드
           </button>
         </div>
       </div>
+    </div>
+  );
 
-      {/* ── 더빙 생성 버튼 ──────────────────────────────────────────────────── */}
-      <button
-        type="submit"
-        disabled={!file || status === "loading"}
-        className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-[#93c5fd] text-white rounded-2xl px-6 py-4 text-[15px] font-semibold transition-all hover:-translate-y-px hover:shadow-[0_6px_20px_rgba(37,99,235,0.28)] active:translate-y-0 disabled:cursor-not-allowed"
-      >
-        {status === "loading" ? (
-          <>
-            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-            처리 중…
-          </>
-        ) : (
-          "더빙 생성"
-        )}
-      </button>
-      {status !== "loading" && (
-        <p className="text-center text-xs text-[#a8a29e]">보통 15~45초 정도 소요됩니다</p>
-      )}
+  return (
+    // 데스크탑: 2컬럼 그리드 / 모바일: 단일 컬럼
+    <div className="w-full grid md:grid-cols-2 md:gap-6 md:items-start gap-3">
 
-      {/* ── 로딩 카드 ────────────────────────────────────────────────────────── */}
-      {status === "loading" && (
+      {/* ── 왼쪽 컬럼: 폼 ───────────────────────────────────────────────────── */}
+      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+
+        {/* Step 01: 파일 선택 */}
         <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
-          <div className="flex flex-col items-center gap-4">
-            <div className="w-10 h-10 rounded-full border-[3px] border-[#e4e3df] border-t-blue-600 animate-spin" />
-            <div className="flex flex-col items-center gap-1 text-center">
-              <p className="text-sm font-semibold text-[#1a1917]">
-                {step === 0 && "파일 확인 중…"}
-                {step === 1 && (isVideoFile ? "영상에서 오디오 추출 중…" : "음원 전처리 중…")}
-                {step === 2 && "서버에서 처리 중…"}
-              </p>
-              {step === 2 && (
-                <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
-                  <span className="text-xs font-medium text-blue-500">음성 전사</span>
-                  <span className="text-xs text-[#a8a29e]">→</span>
-                  <span className="text-xs font-medium text-blue-500">{selectedLabel} 번역</span>
-                  <span className="text-xs text-[#a8a29e]">→</span>
-                  <span className="text-xs font-medium text-blue-500">음성 합성</span>
-                </div>
-              )}
-              <p className="text-xs text-[#a8a29e] mt-0.5">오디오 길이에 따라 15~45초 소요됩니다</p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── 오류 ──────────────────────────────────────────────────────────────── */}
-      {status === "error" && error && (
-        <div className="bg-white border border-red-100 rounded-2xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
-          <p className="text-sm font-semibold text-red-700 mb-1">오류가 발생했습니다</p>
-          <p className="whitespace-pre-wrap text-sm text-red-600">{error}</p>
-          <p className="mt-2.5 text-xs text-red-400">
-            다른 파일 형식으로 시도하거나, 더 짧은 오디오 파일을 업로드해 보세요.
-          </p>
-        </div>
-      )}
-
-      {/* ── 결과 ──────────────────────────────────────────────────────────────── */}
-      {status === "done" && result && (
-        <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
-          <div className="flex items-center gap-2.5 mb-5">
-            <span className="w-7 h-7 rounded-full bg-[#dcfce7] text-green-600 flex items-center justify-center text-sm flex-shrink-0">
-              ✓
+          <div className="flex items-center gap-3 mb-4">
+            <span className="w-7 h-7 rounded-lg bg-[rgba(37,99,235,0.1)] text-blue-600 text-[13px] font-bold flex items-center justify-center flex-shrink-0">
+              01
             </span>
             <div>
-              <p className="text-sm font-semibold text-[#1a1917]">더빙 완료</p>
-              <p className="text-xs text-[#a8a29e]">{selectedLabel}로 더빙되었습니다</p>
+              <p className="text-sm font-semibold text-[#1a1917]">파일 선택</p>
+              <p className="text-xs text-[#a8a29e]">오디오 또는 영상 파일을 업로드하세요</p>
             </div>
           </div>
 
-          <div className="flex flex-col gap-4">
+          {!file ? (
+            <label
+              className={`flex flex-col items-center gap-3 w-full cursor-pointer rounded-xl border-[1.5px] border-dashed py-8 px-4 text-center transition-all duration-150 ${
+                isDragging
+                  ? "border-blue-400 bg-[rgba(37,99,235,0.06)]"
+                  : "border-[#d0cfc9] hover:border-blue-500 hover:bg-[rgba(37,99,235,0.04)]"
+              }`}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              <div className={`w-11 h-11 rounded-xl border flex items-center justify-center text-xl transition-all ${
+                isDragging
+                  ? "bg-[rgba(37,99,235,0.07)] border-[rgba(37,99,235,0.25)]"
+                  : "bg-[#f5f4f0] border-[#e4e3df]"
+              }`}>
+                🎵
+              </div>
+              <div>
+                <p className="text-sm font-medium text-[#1a1917] mb-0.5">
+                  {isDragging ? "여기에 놓으세요" : (
+                    <><span className="text-blue-600">파일 선택</span> 또는 드래그 앤 드롭</>
+                  )}
+                </p>
+                <p className="text-xs text-[#a8a29e]">최대 60초 구간을 직접 선택할 수 있습니다</p>
+              </div>
+              <div className="flex flex-wrap justify-center gap-1.5">
+                {["MP3", "WAV", "M4A", "FLAC", "OGG", "MP4", "WebM"].map((f) => (
+                  <span key={f} className="bg-[#f5f4f0] border border-[#e4e3df] rounded-md px-2 py-0.5 text-[11px] font-medium text-[#a8a29e] tracking-wide">
+                    {f}
+                  </span>
+                ))}
+              </div>
+              <input
+                type="file"
+                accept="audio/*,video/mp4,video/webm,video/quicktime"
+                onChange={handleFileChange}
+                className="sr-only"
+              />
+            </label>
+          ) : (
+            <div className="flex items-center gap-3 bg-[rgba(37,99,235,0.06)] border border-[rgba(37,99,235,0.2)] rounded-xl px-4 py-3.5">
+              <span className="text-2xl">{isVideoFile ? "🎬" : "🎵"}</span>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-[#1a1917] truncate">{file.name}</p>
+                <p className="text-xs text-[#a8a29e]">
+                  {(file.size / 1024 / 1024).toFixed(1)} MB
+                  {fileDuration !== null && ` · 전체 ${formatTime(fileDuration)}`}
+                  {isVideoFile && " · 영상"}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => selectFile(null)}
+                className="text-[#a8a29e] hover:text-[#1a1917] hover:bg-black/5 rounded-lg p-1.5 transition-colors text-xl leading-none"
+              >
+                ×
+              </button>
+            </div>
+          )}
 
-            {/* ── 멀티 재생 플레이어 ──────────────────────────────────────────── */}
+          {/* 크롭 범위 슬라이더 */}
+          {file && showCropSlider && (
+            <div className="mt-4 bg-[#f5f4f0] rounded-xl p-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-[#57534e]">처리 구간 선택</p>
+                <span className="text-xs font-medium text-blue-600 bg-blue-50 border border-blue-100 rounded-lg px-2 py-0.5 tabular-nums">
+                  {formatTime(cropStart)} ~ {formatTime(cropEnd)}
+                  <span className="text-blue-400 ml-1">({Math.round(cropDuration)}초)</span>
+                </span>
+              </div>
+              <div className="flex flex-col gap-4">
+                <div>
+                  <div className="flex justify-between mb-1.5">
+                    <label className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide">시작</label>
+                    <span className="text-[11px] font-semibold text-[#57534e] tabular-nums">{formatTime(cropStart)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(0, Math.floor(fileDuration) - 1)}
+                    step={1}
+                    value={cropStart}
+                    onChange={(e) => handleCropStartChange(Number(e.target.value))}
+                    className="w-full h-2 accent-blue-600 cursor-pointer"
+                  />
+                </div>
+                <div>
+                  <div className="flex justify-between mb-1.5">
+                    <label className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide">끝</label>
+                    <span className="text-[11px] font-semibold text-[#57534e] tabular-nums">{formatTime(cropEnd)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={1}
+                    max={Math.ceil(fileDuration)}
+                    step={1}
+                    value={cropEnd}
+                    onChange={(e) => handleCropEndChange(Number(e.target.value))}
+                    className="w-full h-2 accent-blue-600 cursor-pointer"
+                  />
+                </div>
+              </div>
+              {cropDuration > CROP_LIMIT_SEC && (
+                <p className="text-xs text-amber-600 mt-2.5">
+                  ⚠ 최대 60초까지 선택할 수 있습니다. 범위를 줄여 주세요.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Step 02: 목표 언어 + 자막 토글 */}
+        <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+          <div className="flex items-center gap-3 mb-4">
+            <span className="w-7 h-7 rounded-lg bg-[rgba(37,99,235,0.1)] text-blue-600 text-[13px] font-bold flex items-center justify-center flex-shrink-0">
+              02
+            </span>
             <div>
-              {/* 원본 / 더빙 탭 */}
-              <div className="flex rounded-xl border border-[#e4e3df] overflow-hidden mb-3">
+              <p className="text-sm font-semibold text-[#1a1917]">목표 언어</p>
+              <p className="text-xs text-[#a8a29e]">원본 언어는 자동으로 감지됩니다</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-[1fr_40px_1fr] items-end gap-2">
+            <div>
+              <label className="block text-[11px] font-medium text-[#a8a29e] uppercase tracking-widest mb-1.5">원본</label>
+              <div className="w-full border border-[#e4e3df] rounded-xl px-3 py-2.5 text-sm font-medium text-[#a8a29e] bg-[#f5f4f0] select-none">
+                자동 감지
+              </div>
+            </div>
+            <div className="flex items-center justify-center h-[42px] text-[#a8a29e] text-base">→</div>
+            <div>
+              <label className="block text-[11px] font-medium text-[#a8a29e] uppercase tracking-widest mb-1.5">목표</label>
+              <select
+                value={targetLanguage}
+                onChange={(e) => setTargetLanguage(e.target.value)}
+                className="w-full border-[1.5px] border-[#e4e3df] rounded-xl px-3 py-2.5 text-sm font-medium text-[#1a1917] bg-[#f5f4f0] focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 focus:outline-none cursor-pointer transition-all appearance-none"
+              >
+                {SUPPORTED_LANGUAGES.map((lang) => (
+                  <option key={lang.code} value={lang.code}>{lang.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* 자막 토글 */}
+          <div className="mt-4 pt-4 border-t border-[#e4e3df]">
+            <button
+              type="button"
+              onClick={() => setShowSubtitles((v) => !v)}
+              className="flex items-center gap-3 w-full text-left group"
+            >
+              <div className={`relative flex-shrink-0 w-9 h-5 rounded-full transition-colors duration-200 ${showSubtitles ? "bg-blue-600" : "bg-[#d0cfc9]"}`}>
+                <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-transform duration-200 ${showSubtitles ? "translate-x-4" : ""}`} />
+              </div>
+              <div>
+                <p className="text-sm font-medium text-[#1a1917] group-hover:text-blue-600 transition-colors">번역 자막 표시</p>
+                <p className="text-xs text-[#a8a29e]">더빙 재생 시 번역문을 자막으로 표시합니다</p>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        {/* 더빙 생성 버튼 */}
+        <button
+          type="submit"
+          disabled={!file || status === "loading"}
+          className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-[#93c5fd] text-white rounded-2xl px-6 py-4 text-[15px] font-semibold transition-all hover:-translate-y-px hover:shadow-[0_6px_20px_rgba(37,99,235,0.28)] active:translate-y-0 disabled:cursor-not-allowed"
+        >
+          {status === "loading" ? (
+            <>
+              <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+              처리 중…
+            </>
+          ) : "더빙 생성"}
+        </button>
+        {status !== "loading" && (
+          <p className="text-center text-xs text-[#a8a29e]">보통 15~45초 정도 소요됩니다</p>
+        )}
+
+        {/* 로딩 카드 */}
+        {status === "loading" && (
+          <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-10 h-10 rounded-full border-[3px] border-[#e4e3df] border-t-blue-600 animate-spin" />
+              <div className="flex flex-col items-center gap-1 text-center">
+                <p className="text-sm font-semibold text-[#1a1917]">
+                  {step === 0 && "파일 확인 중…"}
+                  {step === 1 && (isVideoFile ? "영상에서 오디오 추출 중…" : "음원 전처리 중…")}
+                  {step === 2 && "서버에서 처리 중…"}
+                </p>
+                {step === 2 && (
+                  <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
+                    <span className="text-xs font-medium text-blue-500">음성 전사</span>
+                    <span className="text-xs text-[#a8a29e]">→</span>
+                    <span className="text-xs font-medium text-blue-500">{selectedLabel} 번역</span>
+                    <span className="text-xs text-[#a8a29e]">→</span>
+                    <span className="text-xs font-medium text-blue-500">음성 합성</span>
+                  </div>
+                )}
+                <p className="text-xs text-[#a8a29e] mt-0.5">오디오 길이에 따라 15~45초 소요됩니다</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 오류 */}
+        {status === "error" && error && (
+          <div className="bg-white border border-red-100 rounded-2xl p-5 shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
+            <p className="text-sm font-semibold text-red-700 mb-1">오류가 발생했습니다</p>
+            <p className="whitespace-pre-wrap text-sm text-red-600">{error}</p>
+            <p className="mt-2.5 text-xs text-red-400">
+              다른 파일 형식으로 시도하거나, 더 짧은 오디오 파일을 업로드해 보세요.
+            </p>
+          </div>
+        )}
+
+        {/* 결과 텍스트 + 다운로드 (데스크탑: 왼쪽 컬럼 / 모바일: 여기 표시) */}
+        {status === "done" && result && (
+          <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+            <div className="flex items-center gap-2.5 mb-5">
+              <span className="w-7 h-7 rounded-full bg-[#dcfce7] text-green-600 flex items-center justify-center text-sm flex-shrink-0">✓</span>
+              <div>
+                <p className="text-sm font-semibold text-[#1a1917]">더빙 완료</p>
+                <p className="text-xs text-[#a8a29e]">{selectedLabel}로 더빙되었습니다</p>
+              </div>
+            </div>
+
+            {/* 모바일 전용: 원본/더빙 탭 플레이어 */}
+            <div className="md:hidden mb-4">
+              <div className="flex items-center gap-2 mb-3">
+                <div className="flex flex-1 rounded-xl border border-[#e4e3df] overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setPlaybackMode("original")}
+                    className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
+                      playbackMode === "original" ? "bg-blue-600 text-white" : "bg-[#f5f4f0] text-[#57534e]"
+                    }`}
+                  >
+                    원본
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPlaybackMode("dubbed")}
+                    className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
+                      playbackMode === "dubbed" ? "bg-blue-600 text-white" : "bg-[#f5f4f0] text-[#57534e]"
+                    }`}
+                  >
+                    더빙
+                  </button>
+                </div>
+                {/* 자막 토글 */}
                 <button
                   type="button"
-                  onClick={() => setPlaybackMode("original")}
-                  className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
-                    playbackMode === "original"
-                      ? "bg-blue-600 text-white"
-                      : "bg-[#f5f4f0] text-[#57534e] hover:text-[#1a1917]"
+                  onClick={() => setShowSubtitles((v) => !v)}
+                  className={`flex-shrink-0 text-xs font-medium rounded-xl px-3 py-2.5 border transition-colors ${
+                    showSubtitles
+                      ? "bg-blue-600 text-white border-blue-600"
+                      : "bg-[#f5f4f0] text-[#a8a29e] border-[#e4e3df]"
                   }`}
                 >
-                  원본
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPlaybackMode("dubbed")}
-                  className={`flex-1 py-2.5 text-sm font-medium transition-colors ${
-                    playbackMode === "dubbed"
-                      ? "bg-blue-600 text-white"
-                      : "bg-[#f5f4f0] text-[#57534e] hover:text-[#1a1917]"
-                  }`}
-                >
-                  더빙
+                  자막 {showSubtitles ? "ON" : "OFF"}
                 </button>
               </div>
 
               {isVideoFile ? (
-                /* 비디오 파일 ─────────────────────────────────────────────── */
                 <div className="rounded-xl overflow-hidden bg-black">
-                  {/* 원본 탭: 원본 영상 + 오디오 그대로 */}
                   {playbackMode === "original" && originalUrl && (
                     // eslint-disable-next-line jsx-a11y/media-has-caption
                     <video
-                      src={originalUrl}
+                      src={videoSrc ?? originalUrl}
                       controls
                       playsInline
-                      className="w-full max-h-72 object-contain"
+                      className="w-full max-h-64 object-contain"
                     />
                   )}
-
-                  {/* 더빙 탭: 원본 영상(음소거) + 더빙 오디오 동기화 */}
                   {playbackMode === "dubbed" && originalUrl && audioUrl && (
                     <div className="relative">
                       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                       <video
-                        ref={videoRef}
-                        src={originalUrl}
+                        ref={mobileVideoRef}
+                        src={videoSrc ?? originalUrl}
                         controls
                         playsInline
                         muted
-                        className="w-full max-h-72 object-contain"
-                      />
-                      {/* 숨겨진 더빙 오디오 — videoRef 이벤트에 연동 */}
+                        className="w-full max-h-64 object-contain"
+                      >
+                        {/* WebVTT 트랙: 전체화면 포함 자막 렌더링 */}
+                        {vttUrl && (
+                          <track
+                            kind="subtitles"
+                            src={vttUrl}
+                            label={selectedLabel}
+                            default={showSubtitles}
+                          />
+                        )}
+                      </video>
                       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                      <audio ref={dubAudioRef} src={audioUrl} />
-
-                      {/* 번역 자막 오버레이 */}
-                      {showSubtitles && (
-                        <div className="absolute bottom-12 left-0 right-0 px-3 flex justify-center pointer-events-none">
-                          <p className="bg-black/75 text-white text-sm leading-relaxed rounded-lg px-3 py-1.5 text-center max-w-full backdrop-blur-sm">
-                            {result.translation}
-                          </p>
-                        </div>
-                      )}
+                      <audio ref={mobileDubAudioRef} src={audioUrl} />
                     </div>
                   )}
                 </div>
               ) : (
-                /* 오디오 파일: 원본/더빙 오디오 플레이어 ─────────────────── */
                 <div>
                   {playbackMode === "original" && originalUrl && (
-                    <div>
-                      <p className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide mb-2">
-                        원본 오디오
-                      </p>
-                      {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                      <audio controls src={originalUrl} className="w-full" />
-                    </div>
+                    // eslint-disable-next-line jsx-a11y/media-has-caption
+                    <audio controls src={originalUrl} className="w-full" />
                   )}
                   {playbackMode === "dubbed" && audioUrl && (
                     <div>
-                      <p className="text-[11px] font-medium text-[#a8a29e] uppercase tracking-wide mb-2">
-                        더빙 오디오
-                      </p>
                       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                       <audio controls src={audioUrl} className="w-full" />
-                      {/* 번역 자막 */}
-                      {showSubtitles && (
+                      {showSubtitles && currentSubtitle && (
                         <div className="mt-3 bg-[#1a1917] text-white text-sm leading-relaxed rounded-xl px-4 py-3 text-center">
-                          {result.translation}
+                          {currentSubtitle}
                         </div>
                       )}
                     </div>
                   )}
                 </div>
               )}
+              <div className="h-px bg-[#e4e3df] mt-4" />
             </div>
 
-            <div className="h-px bg-[#e4e3df]" />
-
-            {/* 원문 전사 */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e]">
-                  원문 전사
-                  {result.detectedLanguage && (
-                    <span className="ml-2 normal-case text-blue-400">
-                      {LANGUAGE_NAMES[result.detectedLanguage] ?? result.detectedLanguage}
-                    </span>
-                  )}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const a = document.createElement("a");
-                    a.href = URL.createObjectURL(
-                      new Blob([result.transcript], { type: "text/plain" }),
-                    );
-                    a.download = "transcript.txt";
-                    a.click();
-                  }}
-                  className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
-                >
-                  ↓ txt
-                </button>
-              </div>
-              <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#57534e] bg-[#f5f4f0] rounded-xl px-4 py-3">
-                {result.transcript}
-              </p>
-            </div>
-
-            <div className="h-px bg-[#e4e3df]" />
-
-            {/* 번역 */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e]">
-                  번역 — {selectedLabel}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const a = document.createElement("a");
-                    a.href = URL.createObjectURL(
-                      new Blob([result.translation], { type: "text/plain" }),
-                    );
-                    a.download = `translation_${targetLanguage.toLowerCase()}.txt`;
-                    a.click();
-                  }}
-                  className="text-xs text-[#a8a29e] hover:text-blue-500 transition-colors"
-                >
-                  ↓ txt
-                </button>
-              </div>
-              <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#57534e] bg-[#f5f4f0] rounded-xl px-4 py-3">
-                {result.translation}
-              </p>
-            </div>
-
-            <div className="h-px bg-[#e4e3df]" />
-
-            {/* MP3 다운로드 */}
-            <div>
-              <p className="text-[11px] font-semibold uppercase tracking-widest text-[#a8a29e] mb-2.5">
-                더빙 다운로드
-              </p>
-              <button
-                type="button"
-                onClick={handleDownload}
-                className="w-full flex items-center justify-center gap-2 bg-[#f5f4f0] border-[1.5px] border-[#d0cfc9] rounded-xl px-4 py-3 text-sm font-medium text-[#1a1917] hover:border-blue-500 hover:bg-[rgba(37,99,235,0.04)] hover:text-blue-600 transition-all"
-              >
-                ↓ MP3 다운로드
-              </button>
-            </div>
+            {resultTextPanel}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* 다시 더빙하기 */}
-      {status === "done" && (
-        <button
-          type="button"
-          onClick={() => selectFile(null)}
-          className="w-full rounded-xl border border-[#e4e3df] py-2.5 text-sm font-medium text-[#a8a29e] hover:border-[#d0cfc9] hover:text-[#57534e] transition-colors"
-        >
-          다시 더빙하기
-        </button>
-      )}
-    </form>
+        {/* 다시 더빙하기 */}
+        {status === "done" && (
+          <button
+            type="button"
+            onClick={() => selectFile(null)}
+            className="w-full rounded-xl border border-[#e4e3df] py-2.5 text-sm font-medium text-[#a8a29e] hover:border-[#d0cfc9] hover:text-[#57534e] transition-colors"
+          >
+            다시 더빙하기
+          </button>
+        )}
+      </form>
+
+      {/* ── 오른쪽 컬럼: 플레이어 패널 (데스크탑만) ────────────────────────── */}
+      <div className="hidden md:flex flex-col gap-3 sticky top-[5rem]">
+
+        {/* 원본 패널 */}
+        <div className="bg-white border border-[#e4e3df] rounded-2xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+          <div className="px-5 py-3.5 border-b border-[#e4e3df] flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-[#d0cfc9]" />
+            <p className="text-xs font-semibold uppercase tracking-widest text-[#a8a29e]">원본</p>
+          </div>
+
+          {videoSrc || originalUrl ? (
+            isVideoFile ? (
+              // eslint-disable-next-line jsx-a11y/media-has-caption
+              <video
+                src={videoSrc ?? originalUrl!}
+                controls
+                playsInline
+                className="w-full aspect-video object-contain bg-black"
+              />
+            ) : (
+              <div className="p-4">
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <audio controls src={originalUrl} className="w-full" />
+              </div>
+            )
+          ) : (
+            /* 파일 미선택 플레이스홀더 */
+            <div className="flex flex-col items-center justify-center gap-2 py-10 px-6 text-center">
+              <div className="w-10 h-10 rounded-xl bg-[#f5f4f0] border border-[#e4e3df] flex items-center justify-center text-lg">
+                🎬
+              </div>
+              <p className="text-sm font-medium text-[#a8a29e]">파일을 선택하면</p>
+              <p className="text-xs text-[#c8c7c2]">여기에 원본이 표시됩니다</p>
+            </div>
+          )}
+        </div>
+
+        {/* 화살표 */}
+        <div className="flex items-center justify-center gap-3 py-1">
+          <div className="flex-1 h-px bg-[#e4e3df]" />
+          <span className="text-[#c8c7c2] text-lg select-none">↓</span>
+          <div className="flex-1 h-px bg-[#e4e3df]" />
+        </div>
+
+        {/* 더빙 패널 */}
+        <div className="bg-white border border-[#e4e3df] rounded-2xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+          <div className="px-5 py-3.5 border-b border-[#e4e3df] flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${audioUrl ? "bg-blue-500" : "bg-[#d0cfc9]"}`} />
+            <p className="text-xs font-semibold uppercase tracking-widest text-[#a8a29e]">더빙</p>
+            {audioUrl && (
+              <>
+                <span className="text-[11px] font-medium text-blue-500 bg-blue-50 rounded-md px-1.5 py-0.5">
+                  {selectedLabel}
+                </span>
+                {/* 자막 토글 — 플레이어 헤더에서 바로 켜고 끄기 */}
+                <button
+                  type="button"
+                  onClick={() => setShowSubtitles((v) => !v)}
+                  className={`ml-auto flex items-center gap-1.5 text-[11px] font-medium rounded-md px-2 py-0.5 transition-colors ${
+                    showSubtitles
+                      ? "bg-blue-600 text-white"
+                      : "bg-[#f5f4f0] text-[#a8a29e] hover:text-[#57534e]"
+                  }`}
+                >
+                  자막 {showSubtitles ? "ON" : "OFF"}
+                </button>
+              </>
+            )}
+          </div>
+
+          {audioUrl && originalUrl ? (
+            isVideoFile ? (
+              /* 영상: 원본 영상(음소거) + 더빙 오디오 동기화 */
+              <div className="relative">
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <video
+                  ref={videoRef}
+                  src={videoSrc ?? originalUrl}
+                  controls
+                  playsInline
+                  muted
+                  className="w-full aspect-video object-contain bg-black"
+                >
+                  {/* WebVTT 트랙: 일반 + 전체화면 모두 자막 표시 */}
+                  {vttUrl && (
+                    <track
+                      kind="subtitles"
+                      src={vttUrl}
+                      label={selectedLabel}
+                      default={showSubtitles}
+                    />
+                  )}
+                </video>
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <audio ref={dubAudioRef} src={audioUrl} />
+              </div>
+            ) : (
+              /* 오디오: 더빙 오디오 플레이어 */
+              <div className="p-4 flex flex-col gap-3">
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <audio controls src={audioUrl} className="w-full" />
+                {showSubtitles && currentSubtitle && (
+                  <div className="bg-[#1a1917] text-white text-sm leading-relaxed rounded-xl px-4 py-3 text-center">
+                    {currentSubtitle}
+                  </div>
+                )}
+              </div>
+            )
+          ) : (
+            /* 더빙 미완료 플레이스홀더 */
+            <div className="flex flex-col items-center justify-center gap-2 py-10 px-6 text-center">
+              <div className="w-10 h-10 rounded-xl bg-[#f5f4f0] border border-[#e4e3df] flex items-center justify-center text-lg">
+                {status === "loading" ? (
+                  <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-[#e4e3df] border-t-blue-500" />
+                ) : "🎙️"}
+              </div>
+              <p className="text-sm font-medium text-[#a8a29e]">
+                {status === "loading" ? "더빙 생성 중…" : "더빙 완료 후"}
+              </p>
+              <p className="text-xs text-[#c8c7c2]">
+                {status === "loading" ? "" : "여기에 결과가 표시됩니다"}
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+    </div>
   );
 }
