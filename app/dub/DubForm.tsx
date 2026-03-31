@@ -328,6 +328,8 @@ export default function DubForm() {
   const [playbackMode, setPlaybackMode] = useState<"original" | "dubbed">("dubbed");
   const [status, setStatus] = useState<Status>("idle");
   const [step, setStep] = useState<number>(-1);
+  // step=2(서버 처리) 중 세부 단계: 0=전사 1=번역 2=음성합성
+  const [substep, setSubstep] = useState<0 | 1 | 2>(0);
   const [result, setResult] = useState<DubResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -436,6 +438,15 @@ export default function DubForm() {
     video.addEventListener("timeupdate", update);
     return () => video.removeEventListener("timeupdate", update);
   }, [audioUrl, result, effStart, effEnd]);
+
+  // step=2 진입 시 세부 단계 타이머: 전사(~8s) → 번역(~5s) → 음성합성
+  useEffect(() => {
+    if (step !== 2) { setSubstep(0); return; }
+    setSubstep(0);
+    const t1 = window.setTimeout(() => setSubstep(1), 8000);
+    const t2 = window.setTimeout(() => setSubstep(2), 13000);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [step]);
 
   const selectFile = async (selected: File | null) => {
     // 진행 중인 영상 크롭 취소
@@ -1040,30 +1051,91 @@ export default function DubForm() {
         )}
 
         {/* 로딩 카드 */}
-        {status === "loading" && (
-          <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
-            <div className="flex flex-col items-center gap-4">
-              <div className="w-10 h-10 rounded-full border-[3px] border-[#e4e3df] border-t-blue-600 animate-spin" />
-              <div className="flex flex-col items-center gap-1 text-center">
-                <p className="text-sm font-semibold text-[#1a1917]">
-                  {step === 0 && "파일 확인 중…"}
-                  {step === 1 && (isVideoFile ? "영상에서 오디오 추출 중…" : "음원 전처리 중…")}
-                  {step === 2 && "서버에서 처리 중…"}
-                </p>
-                {step === 2 && (
-                  <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
-                    <span className="text-xs font-medium text-blue-500">음성 전사</span>
-                    <span className="text-xs text-[#a8a29e]">→</span>
-                    <span className="text-xs font-medium text-blue-500">{selectedLabel} 번역</span>
-                    <span className="text-xs text-[#a8a29e]">→</span>
-                    <span className="text-xs font-medium text-blue-500">음성 합성</span>
+        {status === "loading" && (() => {
+          const PIPELINE = [
+            {
+              icon: "🎙",
+              label: "음성 전사",
+              desc: "말소리를 텍스트로 변환 중",
+            },
+            {
+              icon: "🌐",
+              label: `${selectedLabel} 번역`,
+              desc: "전사된 텍스트를 번역 중",
+            },
+            {
+              icon: "🔊",
+              label: "더빙 음성 생성",
+              desc: "번역문으로 새 목소리 합성 중",
+            },
+          ];
+
+          return (
+            <div className="bg-white border border-[#e4e3df] rounded-2xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_8px_24px_rgba(0,0,0,0.06)]">
+              {/* 전처리 단계 (step 0·1) */}
+              {step < 2 ? (
+                <div className="flex flex-col items-center gap-3 text-center">
+                  <div className="w-10 h-10 rounded-full border-[3px] border-[#e4e3df] border-t-blue-600 animate-spin" />
+                  <div>
+                    <p className="text-sm font-semibold text-[#1a1917]">
+                      {step === 0 && "파일 준비 중…"}
+                      {step === 1 && (isVideoFile ? "영상에서 오디오 추출 중…" : "오디오 구간 크롭 중…")}
+                    </p>
+                    <p className="text-xs text-[#a8a29e] mt-0.5">잠깐만요, 곧 서버에 전송합니다</p>
                   </div>
-                )}
-                <p className="text-xs text-[#a8a29e] mt-0.5">오디오 길이에 따라 15~45초 소요됩니다</p>
-              </div>
+                </div>
+              ) : (
+                /* 서버 파이프라인 단계 (step 2) */
+                <div className="flex flex-col gap-4">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-[#a8a29e] text-center">
+                    서버 처리 중
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    {PIPELINE.map((s, i) => {
+                      const isDone    = substep > i;
+                      const isActive  = substep === i;
+                      return (
+                        <div
+                          key={i}
+                          className={`flex items-center gap-3 rounded-xl px-4 py-3 transition-all ${
+                            isActive
+                              ? "bg-blue-50 border border-blue-200"
+                              : isDone
+                                ? "bg-[#f5f4f0] border border-[#e4e3df]"
+                                : "bg-[#fafaf9] border border-[#efefed] opacity-40"
+                          }`}
+                        >
+                          {/* 상태 아이콘 */}
+                          <div className="flex-shrink-0 w-7 h-7 flex items-center justify-center">
+                            {isDone ? (
+                              <span className="text-green-500 text-base">✓</span>
+                            ) : isActive ? (
+                              <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-blue-200 border-t-blue-600" />
+                            ) : (
+                              <span className="text-base">{s.icon}</span>
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className={`text-sm font-semibold ${isActive ? "text-blue-700" : isDone ? "text-[#57534e]" : "text-[#a8a29e]"}`}>
+                              {s.label}
+                            </p>
+                            {isActive && (
+                              <p className="text-xs text-blue-500 mt-0.5">{s.desc}</p>
+                            )}
+                          </div>
+                          {isDone && (
+                            <span className="text-xs text-green-500 font-medium flex-shrink-0">완료</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-[#a8a29e] text-center">보통 15~45초 소요됩니다</p>
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* 오류 */}
         {status === "error" && error && (
@@ -1165,7 +1237,7 @@ export default function DubForm() {
                 <div>
                   {playbackMode === "original" && originalUrl && (
                     // eslint-disable-next-line jsx-a11y/media-has-caption
-                    <audio controls src={originalUrl} className="w-full" />
+                    <audio controls src={originalUrl ?? undefined} className="w-full" />
                   )}
                   {playbackMode === "dubbed" && audioUrl && (
                     <div>
@@ -1227,7 +1299,7 @@ export default function DubForm() {
             ) : (
               <div className="p-4">
                 {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                <audio controls src={originalUrl} className="w-full" />
+                <audio controls src={originalUrl ?? undefined} className="w-full" />
               </div>
             )
           ) : (
