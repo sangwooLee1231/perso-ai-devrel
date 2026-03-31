@@ -193,6 +193,71 @@ function buildSubtitleChunks(text: string): string[] {
 }
 
 /**
+ * MediaRecorder로 영상의 [startSec, endSec] 구간을 실시간 녹화하여
+ * 진짜 크롭된 영상 Blob을 반환한다.
+ * captureStream 미지원 브라우저(iOS Safari 등)는 Error("CAPTURE_STREAM_UNSUPPORTED") 를 throw 한다.
+ * 녹화 속도 = 실시간 (60초 구간 → 약 60초 소요).
+ */
+function cropVideoBlob(file: File, startSec: number, endSec: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const testEl = document.createElement("video");
+    if (!("captureStream" in testEl)) {
+      reject(new Error("CAPTURE_STREAM_UNSUPPORTED"));
+      return;
+    }
+
+    const objUrl = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.src = objUrl;
+    video.muted = true;
+    (video as HTMLVideoElement & { playsInline: boolean }).playsInline = true;
+
+    const cleanup = () => URL.revokeObjectURL(objUrl);
+
+    video.oncanplay = async () => {
+      try {
+        video.currentTime = startSec;
+        await new Promise<void>((r) => {
+          const onSeeked = () => { video.removeEventListener("seeked", onSeeked); r(); };
+          video.addEventListener("seeked", onSeeked);
+        });
+
+        const stream = (video as unknown as { captureStream: () => MediaStream }).captureStream();
+        const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
+        const recorder = new MediaRecorder(stream, { mimeType });
+        const chunks: Blob[] = [];
+
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => { cleanup(); resolve(new Blob(chunks, { type: mimeType })); };
+
+        recorder.start(250);
+        await video.play();
+
+        const duration = endSec - startSec;
+        const timer = setTimeout(() => {
+          video.pause();
+          if (recorder.state === "recording") recorder.stop();
+        }, (duration + 1) * 1000);
+
+        video.ontimeupdate = () => {
+          if (video.currentTime >= endSec) {
+            clearTimeout(timer);
+            video.pause();
+            if (recorder.state === "recording") recorder.stop();
+          }
+        };
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    };
+
+    video.onerror = () => { cleanup(); reject(new Error("video load failed")); };
+    video.load();
+  });
+}
+
+/**
  * video(음소거)와 audio(더빙)를 크롭 구간 [start, end] 내에서 동기화한다.
  * - 영상이 start 이전으로 스크럽되면 audio를 0으로 클램프
  * - 영상이 end를 넘으면 일시정지 후 start로 되감기
@@ -256,6 +321,9 @@ export default function DubForm() {
   const [showSubtitles, setShowSubtitles] = useState<boolean>(true);
   const [subtitleIndex, setSubtitleIndex] = useState<number>(0);
   const [isRecording, setIsRecording] = useState<boolean>(false);
+  // 영상이 MediaRecorder 로 실제 크롭된 경우 true → 플레이어 start=0 기준
+  const [videoCropped, setVideoCropped] = useState<boolean>(false);
+  const [isCroppingVideo, setIsCroppingVideo] = useState<boolean>(false);
   const [vttUrl, setVttUrl] = useState<string | null>(null);
   const [playbackMode, setPlaybackMode] = useState<"original" | "dubbed">("dubbed");
   const [status, setStatus] = useState<Status>("idle");
@@ -275,6 +343,8 @@ export default function DubForm() {
   const blobUrlRef = useRef<string | null>(null);
   const origUrlRef = useRef<string | null>(null);
   const vttUrlRef = useRef<string | null>(null);
+  // cropVideoBlob 진행 중 취소 신호 (selectFile 로 새 파일 선택 시 사용)
+  const cropAbortRef = useRef<{ cancelled: boolean }>({ cancelled: false });
 
   useEffect(() => {
     return () => {
@@ -284,28 +354,32 @@ export default function DubForm() {
     };
   }, []);
 
+  // 영상이 실제 크롭됐으면 start=0 기준, 아니면 cropStart 기준으로 동기화
+  const effStart = videoCropped ? 0 : cropStart;
+  const effEnd   = videoCropped ? cropEnd - cropStart : cropEnd;
+  const effDur   = videoCropped ? cropEnd - cropStart : fileDuration;
+
   // 데스크탑 더빙 패널: 크롭 구간 동기화
   useEffect(() => {
     const video = videoRef.current;
     const audio = dubAudioRef.current;
     if (!video || !audio) return;
-    return attachDubSync(video, audio, cropStart, cropEnd, fileDuration);
-  }, [audioUrl, cropStart, cropEnd, fileDuration]);
+    return attachDubSync(video, audio, effStart, effEnd, effDur);
+  }, [audioUrl, effStart, effEnd, effDur]);
 
   // 모바일 더빙 탭: 크롭 구간 동기화
   useEffect(() => {
     const video = mobileVideoRef.current;
     const audio = mobileDubAudioRef.current;
     if (!video || !audio) return;
-    return attachDubSync(video, audio, cropStart, cropEnd, fileDuration);
-  }, [audioUrl, cropStart, cropEnd, fileDuration]);
+    return attachDubSync(video, audio, effStart, effEnd, effDur);
+  }, [audioUrl, effStart, effEnd, effDur]);
 
   // 결과가 바뀌면 자막 인덱스 초기화
   useEffect(() => { setSubtitleIndex(0); }, [result]);
 
   // 번역 결과 → WebVTT Blob 생성
-  // cropStart 오프셋 + 크롭 구간 전체(cropEnd - cropStart)에 고르게 분배하여
-  // 영상 currentTime과 자막 타이밍이 항상 일치하도록 함
+  // 영상이 실제 크롭된 경우 startOffset=0, 아닌 경우 cropStart 오프셋 사용
   useEffect(() => {
     if (vttUrlRef.current) {
       URL.revokeObjectURL(vttUrlRef.current);
@@ -316,11 +390,12 @@ export default function DubForm() {
 
     const chunks = buildSubtitleChunks(result.translation);
     const duration = Math.max(cropEnd - cropStart, 1);
-    const blob = new Blob([buildVTT(chunks, duration, cropStart)], { type: "text/vtt" });
+    const startOffset = videoCropped ? 0 : cropStart;
+    const blob = new Blob([buildVTT(chunks, duration, startOffset)], { type: "text/vtt" });
     const url = URL.createObjectURL(blob);
     vttUrlRef.current = url;
     setVttUrl(url);
-  }, [result, cropStart, cropEnd]);
+  }, [result, cropStart, cropEnd, videoCropped]);
 
   // showSubtitles 토글 → 모든 video 요소의 track.mode 갱신
   useEffect(() => {
@@ -340,13 +415,13 @@ export default function DubForm() {
     if (!video || !result) return;
     const chunks = buildSubtitleChunks(result.translation);
     const update = () => {
-      const elapsed = video.currentTime - cropStart;
-      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, cropEnd - cropStart)));
+      const elapsed = video.currentTime - effStart;
+      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, effEnd - effStart)));
       setSubtitleIndex(Math.min(Math.floor(p * chunks.length), chunks.length - 1));
     };
     video.addEventListener("timeupdate", update);
     return () => video.removeEventListener("timeupdate", update);
-  }, [audioUrl, result, cropStart, cropEnd]);
+  }, [audioUrl, result, effStart, effEnd]);
 
   // 모바일 더빙 영상: timeupdate → 자막 인덱스 갱신
   useEffect(() => {
@@ -354,15 +429,19 @@ export default function DubForm() {
     if (!video || !result) return;
     const chunks = buildSubtitleChunks(result.translation);
     const update = () => {
-      const elapsed = video.currentTime - cropStart;
-      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, cropEnd - cropStart)));
+      const elapsed = video.currentTime - effStart;
+      const p = Math.max(0, Math.min(1, elapsed / Math.max(1, effEnd - effStart)));
       setSubtitleIndex(Math.min(Math.floor(p * chunks.length), chunks.length - 1));
     };
     video.addEventListener("timeupdate", update);
     return () => video.removeEventListener("timeupdate", update);
-  }, [audioUrl, result, cropStart, cropEnd]);
+  }, [audioUrl, result, effStart, effEnd]);
 
   const selectFile = async (selected: File | null) => {
+    // 진행 중인 영상 크롭 취소
+    cropAbortRef.current.cancelled = true;
+    cropAbortRef.current = { cancelled: false };
+
     setFile(selected);
     setFileDuration(null);
     setCropStart(0);
@@ -372,6 +451,8 @@ export default function DubForm() {
     setStatus("idle");
     setAudioUrl(null);
     setPlaybackMode("dubbed");
+    setVideoCropped(false);
+    setIsCroppingVideo(false);
 
     if (origUrlRef.current) {
       URL.revokeObjectURL(origUrlRef.current);
@@ -511,6 +592,33 @@ export default function DubForm() {
       setResult(data);
       setStatus("done");
       setStep(-1);
+
+      // ── 백그라운드 영상 크롭 ─────────────────────────────────────────────
+      // API 결과는 즉시 표시하고, 영상만 별도로 실시간 크롭해 교체한다.
+      // captureStream 미지원(iOS Safari 등)이면 조용히 건너뛴다.
+      if (isVideo && (cropStart > 0 || cropEnd < (fileDuration ?? Infinity))) {
+        const abortCtrl = cropAbortRef.current;
+        const snapStart = cropStart;
+        const snapEnd = cropEnd;
+        setIsCroppingVideo(true);
+        cropVideoBlob(file, snapStart, snapEnd)
+          .then((blob) => {
+            if (abortCtrl.cancelled) return;
+            const newUrl = URL.createObjectURL(blob);
+            if (origUrlRef.current) URL.revokeObjectURL(origUrlRef.current);
+            origUrlRef.current = newUrl;
+            setOriginalUrl(newUrl);
+            setVideoCropped(true);
+          })
+          .catch((e) => {
+            if ((e as Error).message !== "CAPTURE_STREAM_UNSUPPORTED") {
+              console.warn("[cropVideo] fallback to fragment:", e);
+            }
+          })
+          .finally(() => {
+            if (!abortCtrl.cancelled) setIsCroppingVideo(false);
+          });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
       setError(message);
@@ -617,15 +725,15 @@ export default function DubForm() {
   const cropDuration = cropEnd - cropStart;
   const showCropSlider = fileDuration !== null && fileDuration >= 2;
 
-  // 크롭 구간이 있으면 Media Fragments URI (#t=start,end) 를 붙여
-  // 브라우저 내장 seekbar 가 크롭 범위만 표시하도록 한다.
-  // currentTime 은 여전히 원본 절대 초 기준이므로 attachDubSync 와 호환된다.
+  // 크롭 구간이 있으면 Media Fragments URI (#t=start,end) 를 임시 fallback 으로 사용.
+  // MediaRecorder 크롭이 완료(videoCropped=true)되면 originalUrl 자체가 진짜 크롭 blob
+  // 이므로 fragment 없이 그대로 사용한다.
   const isCropped =
     cropStart > 0 || (fileDuration !== null && cropEnd < fileDuration);
   const videoSrc = originalUrl
-    ? isCropped
-      ? `${originalUrl}#t=${cropStart},${cropEnd}`
-      : originalUrl
+    ? (videoCropped || !isCropped)
+      ? originalUrl
+      : `${originalUrl}#t=${cropStart},${cropEnd}`
     : null;
 
   // 현재 재생 위치에 해당하는 2줄짜리 자막
@@ -1099,6 +1207,12 @@ export default function DubForm() {
           <div className="px-5 py-3.5 border-b border-[#e4e3df] flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-[#d0cfc9]" />
             <p className="text-xs font-semibold uppercase tracking-widest text-[#a8a29e]">원본</p>
+            {isCroppingVideo && (
+              <span className="ml-auto flex items-center gap-1.5 text-[11px] text-amber-600">
+                <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-200 border-t-amber-600" />
+                영상 크롭 중…
+              </span>
+            )}
           </div>
 
           {videoSrc || originalUrl ? (
